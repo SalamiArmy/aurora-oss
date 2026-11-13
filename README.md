@@ -1,4 +1,4 @@
-# Sunswarm (working title)
+# Aurora Open Source
 
 An open-source real-time strategy game: own suns, grow them, send swarms of ships to capture neutral suns and
 crush rival factions. Two to four factions per level, special objects (orbiting and fragile suns, wormholes,
