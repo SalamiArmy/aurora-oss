@@ -1,0 +1,9 @@
+This project is an independent, unofficial real-time strategy game inspired by the general genre of
+"swarm and sun" games. It is not affiliated with, endorsed by, or derived from any commercial game's
+source code, art, audio, levels, or other assets.
+
+All code, levels, sounds, textures and music in this repository were written or generated from scratch by
+the project (see tools/gen_levels.py and tools/gen_oss_assets.py for the generated content).
+
+Licensed under either of the MIT licence (LICENSE-MIT) or the Apache License, Version 2.0 (LICENSE-APACHE),
+at your option.

@@ -1,0 +1,284 @@
+{
+ "format": "aurora-song/1",
+ "name": "menu",
+ "sample_rate": 44100,
+ "seed": 41,
+ "master": 0.8,
+ "reverb": {
+  "decay": 7.5,
+  "damp": 0.55
+ },
+ "instruments": {
+  "sub": {
+   "type": "synth",
+   "osc": [
+    {
+     "wave": "sine",
+     "level": 1.0
+    }
+   ],
+   "attack": 4.0,
+   "decay": 1.0,
+   "sustain": 1.0,
+   "release": 5.0
+  },
+  "drone": {
+   "type": "synth",
+   "osc": [
+    {
+     "wave": "saw",
+     "level": 0.6
+    },
+    {
+     "wave": "saw",
+     "level": 0.4,
+     "octave": 1,
+     "detune": 7
+    }
+   ],
+   "attack": 4.5,
+   "decay": 1.0,
+   "sustain": 1.0,
+   "release": 5.5,
+   "lowpass": {
+    "cutoff": 420,
+    "q": 1.2
+   },
+   "unison": 3,
+   "spread": 14,
+   "width": 0.6,
+   "drive": 0.6
+  },
+  "choir": {
+   "type": "synth",
+   "osc": [
+    {
+     "wave": "saw",
+     "level": 0.7
+    },
+    {
+     "wave": "tri",
+     "level": 0.5,
+     "octave": 1
+    }
+   ],
+   "attack": 4.5,
+   "decay": 1.0,
+   "sustain": 1.0,
+   "release": 6.5,
+   "lowpass": {
+    "cutoff": 1000,
+    "q": 1.0
+   },
+   "unison": 5,
+   "spread": 22,
+   "width": 1.0,
+   "vibrato": {
+    "rate": 4.2,
+    "depth": 9,
+    "delay": 2.0
+   },
+   "drive": 0.4
+  },
+  "ghost": {
+   "type": "synth",
+   "osc": [
+    {
+     "wave": "sine",
+     "level": 1.0
+    },
+    {
+     "wave": "sine",
+     "level": 0.25,
+     "octave": 1
+    }
+   ],
+   "attack": 2.2,
+   "decay": 1.0,
+   "sustain": 1.0,
+   "release": 4.5,
+   "unison": 2,
+   "spread": 9,
+   "width": 0.8,
+   "vibrato": {
+    "rate": 4.6,
+    "depth": 30,
+    "delay": 1.4
+   }
+  },
+  "shimmer": {
+   "type": "synth",
+   "osc": [
+    {
+     "wave": "sine",
+     "level": 1.0
+    }
+   ],
+   "attack": 5.0,
+   "decay": 1.0,
+   "sustain": 1.0,
+   "release": 6.5,
+   "unison": 3,
+   "spread": 18,
+   "width": 1.0,
+   "vibrato": {
+    "rate": 5.2,
+    "depth": 14,
+    "delay": 2.0
+   }
+  },
+  "breath": {
+   "type": "synth",
+   "osc": [
+    {
+     "wave": "noise",
+     "level": 1.0
+    }
+   ],
+   "attack": 6.0,
+   "decay": 1.0,
+   "sustain": 1.0,
+   "release": 6.0,
+   "lowpass": {
+    "cutoff": 380,
+    "q": 6.0,
+    "track": 0.9
+   }
+  },
+  "toll": {
+   "type": "synth",
+   "osc": [
+    {
+     "wave": "sine",
+     "level": 1.0
+    }
+   ],
+   "attack": 0.004,
+   "decay": 7.0,
+   "sustain": 0.0,
+   "release": 6.0,
+   "fm": {
+    "ratio": 2.4,
+    "index": 2.6,
+    "decay": 3.5
+   }
+  }
+ },
+ "stems": {
+  "intro": {
+   "bars": 1,
+   "tracks": []
+  },
+  "beat": {
+   "bars": 1,
+   "tracks": []
+  },
+  "beathigh": {
+   "bars": 1,
+   "tracks": []
+  },
+  "pad_normal": {
+   "bars": 1,
+   "tracks": []
+  },
+  "pad_winning": {
+   "bars": 1,
+   "tracks": []
+  },
+  "pad_losing": {
+   "bars": 1,
+   "tracks": []
+  },
+  "fills": [
+   {
+    "bars": 1,
+    "tracks": []
+   }
+  ],
+  "menu": {
+   "bars": 32,
+   "tracks": [
+    {
+     "instrument": "sub",
+     "gain": 0.07,
+     "pan": 0.0,
+     "events": [
+      [0,"D2",128,0.8], [128,"Bb1",128,0.8], [256,"G1",128,0.8], [384,"A1",128,0.8]
+     ]
+    },
+    {
+     "instrument": "drone",
+     "gain": 0.08,
+     "pan": 0.0,
+     "reverb": 0.35,
+     "events": [
+      [0,"D2",128,0.6], [0,"A2",128,0.5], [128,"Bb1",128,0.6], [128,"F2",128,0.5], [256,"G1",128,0.6], [256,"D2",128,0.5], [384,"A1",128,0.6], [384,"E2",128,0.5]
+     ]
+    },
+    {
+     "instrument": "choir",
+     "gain": 0.042,
+     "pan": 0.0,
+     "chorus": 0.5,
+     "reverb": 0.8,
+     "hp": 120,
+     "events": [
+      [0,"D3",128,0.55], [0,"A3",128,0.55], [0,"F4",128,0.55], [0,"E5",128,0.55], [128,"Bb2",128,0.55], [128,"F3",128,0.55], [128,"A3",128,0.55], [128,"D4",128,0.55], [256,"G2",128,0.55], [256,"D3",128,0.55], [256,"Bb3",128,0.55], [256,"F4",128,0.55], [384,"A2",128,0.55], [384,"E3",128,0.55], [384,"C#4",128,0.55], [384,"G4",128,0.55]
+     ]
+    },
+    {
+     "instrument": "breath",
+     "gain": 0.077,
+     "pan": 0.15,
+     "reverb": 0.7,
+     "events": [
+      [8,"A3",120,0.5], [136,"F3",120,0.5], [264,"D3",120,0.5], [392,"E3",120,0.5]
+     ]
+    },
+    {
+     "instrument": "ghost",
+     "gain": 0.039,
+     "pan": -0.2,
+     "reverb": 0.9,
+     "hp": 200,
+     "delay": {
+      "steps": 12,
+      "feedback": 0.6,
+      "mix": 0.4,
+      "pingpong": true,
+      "damp": 0.55
+     },
+     "events": [
+      [142,"D5",42,0.5], [200,"C5",46,0.45], [270,"Bb4",42,0.5], [328,"A4",46,0.45], [398,"C#5",42,0.5], [456,"E5",46,0.45]
+     ]
+    },
+    {
+     "instrument": "shimmer",
+     "gain": 0.024,
+     "pan": 0.3,
+     "reverb": 1.0,
+     "hp": 400,
+     "events": [
+      [260,"D6",120,0.4], [388,"E6",120,0.4]
+     ]
+    },
+    {
+     "instrument": "toll",
+     "gain": 0.056,
+     "pan": 0.1,
+     "reverb": 1.0,
+     "delay": {
+      "steps": 16,
+      "feedback": 0.45,
+      "mix": 0.35,
+      "pingpong": true,
+      "damp": 0.5
+     },
+     "events": [
+      [0,"D4",1,0.55], [128,"Bb3",1,0.55], [256,"G3",1,0.55], [384,"A3",1,0.55]
+     ]
+    }
+   ]
+  }
+ }
+}

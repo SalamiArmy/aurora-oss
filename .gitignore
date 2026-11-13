@@ -1,0 +1,6 @@
+/target
+/target-*
+*.apk
+*.idsig
+__pycache__/
+*.pyc
