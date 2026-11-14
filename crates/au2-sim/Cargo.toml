@@ -1,0 +1,8 @@
+[package]
+name = "au2-sim"
+edition.workspace = true
+version.workspace = true
+description = "Deterministic, headless simulation of the Aurora RTS rules (see cleanroom/public/RULES.md)"
+
+[dependencies]
+au2-map = { path = "../au2-map" }
