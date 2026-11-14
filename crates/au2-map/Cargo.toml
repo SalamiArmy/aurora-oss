@@ -1,0 +1,5 @@
+[package]
+name = "au2-map"
+edition.workspace = true
+version.workspace = true
+description = "Parser and validator for the .au2 level format (see cleanroom/public/MAPFORMAT.md)"
