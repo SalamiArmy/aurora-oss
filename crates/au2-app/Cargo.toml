@@ -1,0 +1,20 @@
+[package]
+name = "au2-app"
+edition.workspace = true
+version.workspace = true
+description = "Playable windowed front-end for the Aurora RTS (winit + softbuffer, software rendered)"
+
+[dependencies]
+au2-map = { path = "../au2-map" }
+au2-sim = { path = "../au2-sim" }
+winit = "0.30"
+# Pinned: softbuffer >= 0.4.7 needs windows-sys 0.61, whose raw-dylib imports require `dlltool.exe` (absent from the
+# stock x86_64-pc-windows-gnu toolchain). 0.4.6 uses prebuilt import libraries and links with nothing extra.
+softbuffer = "=0.4.6"
+font8x8 = { version = "0.3", default-features = false }
+# Sound effects (ogg via the pure-Rust `lewton` decoder). Optional: build with `--no-default-features` for a silent app.
+rodio = { version = "0.19", default-features = false, features = ["vorbis"], optional = true }
+
+[features]
+default = ["audio"]
+audio = ["dep:rodio"]

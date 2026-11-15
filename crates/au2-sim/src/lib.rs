@@ -324,8 +324,10 @@ impl Terrain {
 
 /// What a faction can see (fog of war). With no fog everything is visible.
 pub struct Vision {
-    all: bool,
-    circles: Vec<(Vec2, f64)>,
+    /// No fog on this level: everything is visible.
+    pub all: bool,
+    /// Visible discs (centre, radius).
+    pub circles: Vec<(Vec2, f64)>,
 }
 impl Vision {
     pub fn visible(&self, p: Vec2) -> bool {
