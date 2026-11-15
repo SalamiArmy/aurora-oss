@@ -109,3 +109,41 @@ Only `cleanroom/public/RULES.md`, `cleanroom/public/MAPFORMAT.md` and files alre
 
 ## App (`au2-app`)
 See the README for controls. Choices are listed there because they are user-visible.
+
+## Android front end
+None of this has run on a device; it is verified only by `cargo check --target aarch64-linux-android -p au2-android`
+(with the MSVC host toolchain: the GNU one lacks `dlltool` for the host-side build dependencies) plus the desktop tests.
+- **Structure**: `au2-app` is now a library (all game/render/input code) plus the desktop `main.rs`. A thin `au2-android`
+  cdylib crate holds `android_main`; it is empty on other targets so the workspace still builds on the desktop. A
+  `cdylib` in `au2-app` itself was rejected so the desktop build stays exactly as it was.
+- **Activity**: winit's `android-native-activity` backend (no Java/Kotlin, no Gradle). Suspend drops the window/surface and
+  opens the pause overlay; resume builds new ones (`ApplicationHandler::suspended/resumed`). Rotation is handled in
+  the app (`configChanges`), which re-fits the board when portrait/landscape flips.
+- **Presenting**: softbuffer 0.4.6 (pinned for the GNU desktop toolchain, see `au2-app/Cargo.toml`) has no Android
+  backend and 0.4.7+ needs `dlltool` on GNU Windows, so `present.rs` writes into the `ANativeWindow` via the `ndk` crate.
+  The buffer is canvas-sized and the compositor scales it to the screen.
+- **Assets**: levels are read through a `LevelSource` trait. Desktop = `FsSource` (the upward directory search is
+  unchanged); Android = the APK asset manager (`levels/levels.txt`, `levels/<stem>.au2`). `levels/` and `assets/` are
+  copied to `crates/au2-android/apk-assets/` (git-ignored) by `tools/build-android.sh` and packed by cargo-apk. `assets/`
+  (sound) is bundled but unused: **audio is off on Android**, because rodio/cpal need `oboe` (C++, NDK) and so cannot
+  even be type-checked locally; `au2-android` depends on `au2-app` with `default-features = false`. (The desktop app does
+  not play sound either at the moment: `audio.rs` is not wired into `main`.)
+- **Touch** (`touch.rs`, translated into the same `Input` as the mouse): tap = left click; one finger from one of your
+  suns = lasso; one finger from elsewhere = pan; two fingers = pinch zoom + pan; presses on the bottom bar/menus never pan.
+  Touch has no right button, so tapping an already-selected sun sends the selection to it (the mouse's "right-click own
+  sun to upgrade"). Pick radius is 22 px (6 on desktop), drag slop 14 px (8). No hover cursor in touch mode.
+- **HUD scaling**: on Android the canvas is `floor(short side / 480)` times smaller than the screen (UI px are
+  "logical"); touch mode has a 60 px bottom bar, 42-44 px buttons, and the bar's buttons shrink to fit narrow
+  (portrait) screens. A new **All** button (select all suns) exists on desktop too. Android Back = Esc.
+- **Packaging**: `cargo-apk` 0.10 (aapt2/zipalign/apksigner from the SDK; no Gradle) rather than `cargo-apk2`/`cargo-ndk`:
+  the better-known tool, whose manifest settings live in `[package.metadata.android]` of `au2-android`. I could not
+  fetch its documentation while writing this, so key names and the `CARGO_APK_RELEASE_KEYSTORE[_PASSWORD]` variables
+  are from memory and are the first thing to check if the workflow fails.
+- **Signing**: cargo-apk cannot choose a key alias, so it always signs with a throwaway debug keystore generated per run
+  (it refuses to build a release otherwise), and `tools/build-android.sh` then re-signs with `apksigner` using
+  `ANDROID_KEYSTORE_B64` / `ANDROID_KEYSTORE_PASSWORD` / `ANDROID_KEY_ALIAS` when all three exist (key password assumed
+  equal to the store password). Without them it keeps the debug-signed APK and prints a warning (log + workflow annotation).
+- **CI**: `release.yml` gets an `android` job (artifact `android-arm64`, published as
+  `aurora-oss-<tag>-android-arm64.apk`); `ci.yml` has the same job build-only. The release job still publishes the desktop
+  zips if the Android job fails. SDK/NDK are installed with the runner's `sdkmanager` (platform 33, build-tools 34.0.0,
+  NDK 26.3.11579264); shared steps live in `.github/actions/android-setup`.

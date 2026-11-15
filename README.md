@@ -29,7 +29,8 @@ python tools/gen_oss_assets.py assets        # needs numpy and soundfile
 |---|---|
 | `au2-map` | `.au2` parser/validator and `levels/levels.txt` index loader. Errors carry line numbers; a test loads every shipped level. |
 | `au2-sim` | Headless deterministic simulation (fixed 60 Hz step, seeded RNG, no wall clock), AI, and a unit test per rule. |
-| `au2-app` | Playable desktop app: winit window + softbuffer, software-rendered; mouse orders; sfx via rodio. |
+| `au2-app` | Playable desktop app: winit window + softbuffer, software-rendered; mouse and touch orders. Sound-effect code (`audio.rs`, rodio) exists but is not wired in yet. |
+| `au2-android` | Android entry point (NativeActivity cdylib) around `au2-app`; empty on other targets. |
 | `au2-music` | Synthesiser and procedural songs (not yet wired into the app). |
 
 ## Build and run
@@ -50,12 +51,37 @@ Controls (also on F1 in game): left-click/drag-lasso to select your suns, right-
 ships, the bottom bar sets the send fraction (25/50/100%), repeat/cancel orders, pause, speed, fit-view and menu;
 wheel zooms, middle-drag pans, Esc returns to the menu.
 
+## Android (experimental, untested on a device)
+Tagged releases include `aurora-oss-<tag>-android-arm64.apk` (arm64-v8a, Android 8.0+). It is signed with the release
+key if the repository secrets `ANDROID_KEYSTORE_B64`, `ANDROID_KEYSTORE_PASSWORD` and `ANDROID_KEY_ALIAS` are set,
+otherwise with a throwaway debug key (the workflow log and a warning say which). It has **not been run on any device or
+emulator**; treat it as a starting point.
+
+Touch controls: tap one of your suns to select it; with suns selected, tap a target (a sun, wormhole, white hole,
+supernova or empty space) to send ships; tap an already selected sun again to send the selection to it (upgrade).
+Drag from one of your suns to lasso-select; drag from anywhere else to pan; pinch to zoom. The bottom bar sets the send
+fraction, repeat/cancel, pause, speed, fit, and **All** (select all your suns). The Back button opens the pause menu.
+The UI is drawn at a lower resolution and scaled up, and the board is re-fitted when the screen rotates. No sound yet.
+
+Build it yourself (Linux/macOS/WSL shell; needs the Android SDK with `platforms;android-33` and build-tools, an NDK, a
+JDK, `rustup target add aarch64-linux-android` and `cargo install cargo-apk --version 0.10.0 --locked`):
+
+```
+export ANDROID_HOME=/path/to/sdk ANDROID_NDK_ROOT=/path/to/sdk/ndk/<version>
+tools/build-android.sh out/aurora.apk       # stages levels/ + assets/ into the APK, builds, signs
+```
+
+Type-check only, without an NDK (use a toolchain whose host tools build, e.g. the MSVC one on Windows):
+`cargo check --target aarch64-linux-android -p au2-android`.
+
 ## Not implemented / limitations
 - `au2-music` is not wired into the app (optional per the brief); only sound effects play.
 - Rendering is flat 2D software drawing; `assets/` textures and meshes are not used (sfx only).
 - Runtime-state and cosmetic map fields are ignored; see `DECISIONS.md` for each spec ambiguity and choice.
-- Desktop only: no Android front end. The windowed app was verified by building and by headless snapshot
-  rendering; interactive play was not exercised in an automated test.
+- The windowed apps were verified by building, unit tests (including the touch-gesture logic) and headless snapshot
+  rendering; interactive play was not exercised in an automated test. **The Android APK has never been run on a device
+  or emulator**: so far only `cargo check --target aarch64-linux-android` passes. The APK packaging (cargo-apk, SDK/NDK
+  setup, signing) is unverified until the first workflow run, and the Android build has no sound.
 
 ## Licence
 Dual-licensed under [MIT](LICENSE-MIT) or [Apache-2.0](LICENSE-APACHE), at your option. See [NOTICE](NOTICE).
