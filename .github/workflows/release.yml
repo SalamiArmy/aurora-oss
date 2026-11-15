@@ -1,0 +1,69 @@
+name: Release
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            name: windows-x86_64
+            toolchain: stable-x86_64-pc-windows-gnu
+            exe: au2-app.exe
+          - os: ubuntu-latest
+            name: linux-x86_64
+            toolchain: stable
+            exe: au2-app
+          - os: macos-latest
+            name: macos-arm64
+            toolchain: stable
+            exe: au2-app
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Linux system libraries
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libasound2-dev libxkbcommon-dev libwayland-dev
+      - run: rustup toolchain install ${{ matrix.toolchain }} --profile minimal
+      - uses: Swatinem/rust-cache@v2
+      - name: Test
+        run: cargo +${{ matrix.toolchain }} test --workspace --release
+      - name: Build
+        run: cargo +${{ matrix.toolchain }} build --release -p au2-app
+      - name: Package
+        shell: bash
+        run: |
+          TAG="${GITHUB_REF_NAME}"
+          DIR="sunswarm-${TAG}-${{ matrix.name }}"
+          mkdir "$DIR"
+          cp "target/release/${{ matrix.exe }}" "$DIR/"
+          cp -r levels assets "$DIR/"
+          cp README.md LICENSE-APACHE LICENSE-MIT NOTICE "$DIR/"
+          PY=$(command -v python3 || command -v python)
+          "$PY" -c "import shutil,sys; shutil.make_archive(sys.argv[1],'zip',root_dir='.',base_dir=sys.argv[1])" "$DIR"
+          echo "ASSET=$DIR.zip" >> "$GITHUB_ENV"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.name }}
+          path: ${{ env.ASSET }}
+
+  release:
+    needs: build
+    if: ${{ !cancelled() && startsWith(github.ref, 'refs/tags/v') }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*.zip
+          generate_release_notes: true
