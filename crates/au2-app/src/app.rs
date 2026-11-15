@@ -4,11 +4,11 @@
 use crate::game::{Game, Input, Overlay};
 use crate::gfx::Canvas;
 use crate::render::{self, button, UiAction, FACTION_COLORS, WHITE};
+use crate::present::Presenter;
 use crate::source::LevelSource;
 use crate::touch::{Phase, Touch};
 use au2_map::LevelEntry;
 use au2_sim::{Command, Status};
-use std::num::NonZeroU32;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 use winit::application::ApplicationHandler;
@@ -39,7 +39,7 @@ enum Transition {
 
 pub struct App {
     window: Option<Rc<Window>>,
-    surface: Option<softbuffer::Surface<Rc<Window>, Rc<Window>>>,
+    surface: Option<Presenter>,
     canvas: Canvas,
     input: Input,
     touch: Touch,
@@ -190,36 +190,15 @@ impl App {
 
     /// Copy the canvas to the window surface, upscaling by `self.scale` (nearest neighbour).
     fn present(&mut self, pw: i32, ph: i32) {
-        let Some(surface) = &mut self.surface else { return };
-        let (Some(a), Some(b)) = (NonZeroU32::new(pw as u32), NonZeroU32::new(ph as u32)) else { return };
-        if surface.resize(a, b).is_err() {
-            return;
+        if let Some(surface) = &mut self.surface {
+            surface.present(&self.canvas, pw, ph, self.scale);
         }
-        let Ok(mut buf) = surface.buffer_mut() else { return };
-        let s = self.scale.max(1) as usize;
-        let (cw, ch) = (self.canvas.w as usize, self.canvas.h as usize);
-        if s == 1 {
-            if buf.len() == self.canvas.buf.len() {
-                buf.copy_from_slice(&self.canvas.buf);
-            }
-        } else if buf.len() == (pw * ph) as usize {
-            let pw = pw as usize;
-            for y in 0..ph as usize {
-                let src = &self.canvas.buf[(y / s).min(ch - 1) * cw..][..cw];
-                let dst = &mut buf[y * pw..][..pw];
-                for (x, d) in dst.iter_mut().enumerate() {
-                    *d = src[(x / s).min(cw - 1)];
-                }
-            }
-        }
-        let _ = buf.present();
     }
 
     fn create_window(&mut self, el: &ActiveEventLoop) {
         let attrs = Window::default_attributes().with_title("Aurora").with_inner_size(LogicalSize::new(1280.0, 800.0));
         let win = Rc::new(el.create_window(attrs).expect("create window"));
-        let ctx = softbuffer::Context::new(win.clone()).expect("graphics context");
-        self.surface = Some(softbuffer::Surface::new(&ctx, win.clone()).expect("surface"));
+        self.surface = Some(Presenter::new(&win).expect("graphics surface"));
         let s = win.inner_size();
         self.scale = self.scale_for(s.width as i32, s.height as i32);
         self.canvas.resize((s.width as i32 / self.scale).max(1), (s.height as i32 / self.scale).max(1));

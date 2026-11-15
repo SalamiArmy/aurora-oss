@@ -5,6 +5,7 @@ pub mod app;
 pub mod game;
 pub mod gfx;
 pub mod png;
+pub mod present;
 pub mod render;
 pub mod source;
 pub mod touch;

@@ -1,0 +1,39 @@
+[package]
+name = "au2-android"
+edition.workspace = true
+version.workspace = true
+description = "Android entry point (NativeActivity) for the Aurora RTS; shares all game and render code with au2-app"
+
+# An empty library on every non-Android target, so `cargo build --workspace` still works on the desktop.
+[lib]
+name = "au2_android"
+crate-type = ["cdylib"]
+
+[dependencies]
+# No audio: rodio/cpal pull in oboe (C++), which needs the NDK just to type-check. The Android build is silent.
+au2-app = { path = "../au2-app", default-features = false }
+
+[target.'cfg(target_os = "android")'.dependencies]
+winit = { version = "0.30", features = ["android-native-activity"] }
+log = "0.4"
+android_logger = "0.14"
+
+# --- APK packaging, read by cargo-apk (see DECISIONS.md and tools/build-android.sh) ---------------------------------
+[package.metadata.android]
+package = "org.auroraoss.aurora"
+apk_name = "aurora-oss"
+# tools/build-android.sh copies the repository's levels/ and assets/ here before building
+assets = "apk-assets"
+build_targets = ["aarch64-linux-android"]
+
+[package.metadata.android.sdk]
+min_sdk_version = 26
+target_sdk_version = 33
+
+[package.metadata.android.application]
+label = "Aurora"
+theme = "@android:style/Theme.DeviceDefault.NoActionBar.Fullscreen"
+
+[package.metadata.android.application.activity]
+# rotation is handled by the app (it re-fits the board) rather than by recreating the activity
+config_changes = "orientation|keyboardHidden|screenSize|screenLayout|smallestScreenSize"
