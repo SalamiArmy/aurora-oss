@@ -2,5 +2,6 @@
 /target-*
 *.apk
 *.idsig
+/crates/au2-android/apk-assets/
 __pycache__/
 *.pyc

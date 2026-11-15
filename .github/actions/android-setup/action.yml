@@ -1,0 +1,28 @@
+name: Android build setup
+description: Rust target, Android SDK platform/build-tools/NDK and cargo-apk on an ubuntu runner
+runs:
+  using: composite
+  steps:
+    - name: Rust toolchain and Android target
+      shell: bash
+      run: rustup toolchain install stable --profile minimal --target aarch64-linux-android
+    - uses: Swatinem/rust-cache@v2
+    - name: Android SDK components
+      shell: bash
+      run: |
+        SDK="${ANDROID_HOME:-$ANDROID_SDK_ROOT}"
+        SDKMANAGER="$(command -v sdkmanager || echo "$SDK/cmdline-tools/latest/bin/sdkmanager")"
+        yes | "$SDKMANAGER" --licenses >/dev/null || true
+        "$SDKMANAGER" "platforms;android-33" "build-tools;34.0.0" "ndk;26.3.11579264"
+        echo "ANDROID_HOME=$SDK" >> "$GITHUB_ENV"
+        echo "ANDROID_NDK_ROOT=$SDK/ndk/26.3.11579264" >> "$GITHUB_ENV"
+    - name: cargo-apk (cached)
+      id: cache
+      uses: actions/cache@v4
+      with:
+        path: ~/.cargo/bin/cargo-apk
+        key: cargo-apk-0.10.0-${{ runner.os }}
+    - name: Install cargo-apk
+      if: steps.cache.outputs.cache-hit != 'true'
+      shell: bash
+      run: cargo install cargo-apk --version 0.10.0 --locked

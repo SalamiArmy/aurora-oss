@@ -12,3 +12,11 @@ jobs:
       - run: rustup toolchain install stable-x86_64-pc-windows-gnu --profile minimal
       - uses: Swatinem/rust-cache@v2
       - run: cargo +stable-x86_64-pc-windows-gnu test --workspace --release
+
+  android:
+    # Build-only check that the APK still builds (debug-signed; nothing is uploaded).
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/android-setup
+      - run: tools/build-android.sh "$RUNNER_TEMP/aurora-ci.apk"
