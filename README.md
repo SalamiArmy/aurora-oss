@@ -24,11 +24,38 @@ python tools/gen_levels.py levels
 python tools/gen_oss_assets.py assets        # needs numpy and soundfile
 ```
 
-## Roadmap
-1. Simulation core written from `RULES.md` (deterministic, 60 Hz fixed step).
-2. Map loader written from `MAPFORMAT.md`.
-3. AI that finishes every shipped level.
-4. Desktop and Android front ends.
+## Crates
+| Crate | What |
+|---|---|
+| `au2-map` | `.au2` parser/validator and `levels/levels.txt` index loader. Errors carry line numbers; a test loads every shipped level. |
+| `au2-sim` | Headless deterministic simulation (fixed 60 Hz step, seeded RNG, no wall clock), AI, and a unit test per rule. |
+| `au2-app` | Playable desktop app: winit window + softbuffer, software-rendered; mouse orders; sfx via rodio. |
+| `au2-music` | Synthesiser and procedural songs (not yet wired into the app). |
+
+## Build and run
+Windows with the GNU toolchain (no extra system libraries needed):
+
+```
+cargo +stable-x86_64-pc-windows-gnu build --workspace --release
+cargo +stable-x86_64-pc-windows-gnu test --workspace
+cargo +stable-x86_64-pc-windows-gnu run --release -p au2-app            # level menu
+cargo +stable-x86_64-pc-windows-gnu run --release -p au2-app -- dawn_twin --seed 1
+```
+
+On other platforms use plain `cargo`. `au2-app` finds `levels/` and `assets/` by searching upwards from the working
+directory or executable; override with `--root DIR` or `AU2_ROOT`. Build with `--no-default-features` for a silent
+app (no rodio / audio libraries). `--snapshot out.png --ticks N` renders a headless AI-vs-AI frame to a PNG.
+
+Controls (also on F1 in game): left-click/drag-lasso to select your suns, right-click (or click) a target to send
+ships, the bottom bar sets the send fraction (25/50/100%), repeat/cancel orders, pause, speed, fit-view and menu;
+wheel zooms, middle-drag pans, Esc returns to the menu.
+
+## Not implemented / limitations
+- `au2-music` is not wired into the app (optional per the brief); only sound effects play.
+- Rendering is flat 2D software drawing; `assets/` textures and meshes are not used (sfx only).
+- Runtime-state and cosmetic map fields are ignored; see `DECISIONS.md` for each spec ambiguity and choice.
+- Desktop only: no Android front end. The windowed app was verified by building and by headless snapshot
+  rendering; interactive play was not exercised in an automated test.
 
 ## Licence
 Dual-licensed under [MIT](LICENSE-MIT) or [Apache-2.0](LICENSE-APACHE), at your option. See [NOTICE](NOTICE).

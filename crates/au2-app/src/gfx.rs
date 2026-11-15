@@ -11,11 +11,6 @@ pub struct Canvas {
     pub buf: Vec<u32>,
 }
 
-#[inline]
-fn pack(c: Rgb) -> u32 {
-    ((c[0] as u32) << 16) | ((c[1] as u32) << 8) | c[2] as u32
-}
-
 impl Canvas {
     pub fn new(w: i32, h: i32) -> Self {
         Canvas { w, h, buf: vec![0; (w.max(1) * h.max(1)) as usize] }
@@ -27,10 +22,6 @@ impl Canvas {
             self.h = h;
             self.buf = vec![0; (w.max(1) * h.max(1)) as usize];
         }
-    }
-
-    pub fn clear(&mut self, c: Rgb) {
-        self.buf.fill(pack(c));
     }
 
     /// Normal alpha blend of one pixel.
