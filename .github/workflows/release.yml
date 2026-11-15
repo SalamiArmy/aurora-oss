@@ -41,7 +41,7 @@ jobs:
         shell: bash
         run: |
           TAG="${GITHUB_REF_NAME}"
-          DIR="sunswarm-${TAG}-${{ matrix.name }}"
+          DIR="aurora-oss-${TAG}-${{ matrix.name }}"
           mkdir "$DIR"
           cp "target/release/${{ matrix.exe }}" "$DIR/"
           cp -r levels assets "$DIR/"
