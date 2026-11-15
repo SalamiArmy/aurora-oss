@@ -14,6 +14,7 @@ trap 'echo "::error::build-android.sh failed at line $LINENO: $BASH_COMMAND" >&2
 
 OUT="${1:?usage: tools/build-android.sh OUT.apk}"
 cd "$(dirname "$0")/.."
+mkdir -p "$(dirname "$OUT")"
 OUT="$(cd "$(dirname "$OUT")" && pwd)/$(basename "$OUT")"
 
 SDK="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-}}"
