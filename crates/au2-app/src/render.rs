@@ -1,6 +1,6 @@
 //! Drawing the game and its HUD onto the software canvas.
 
-use crate::game::{Game, Input, Overlay, BAR_H};
+use crate::game::{Game, Input, Overlay};
 use crate::gfx::{mix_rgb, scale_rgb, Canvas, Rgb};
 use au2_map::TerrainKind;
 use au2_sim::math::Vec2;
@@ -391,7 +391,7 @@ pub fn draw_game(c: &mut Canvas, g: &Game, input: &Input) {
 
     // ------------------------------------------------------------------ selection feedback
     let modal = g.overlay != Overlay::None || sim.status != Status::Playing;
-    if !modal && !g.selection.is_empty() && input.mouse.1 < view.1 - BAR_H {
+    if !modal && !g.selection.is_empty() && !input.touch_mode && input.mouse.1 < view.1 - g.bar_h {
         let wp = g.to_world(input.mouse, view);
         let hover = sim.pick(wp, (6.0 / z) as f64);
         let (tx, ty, col) = match hover {
@@ -417,7 +417,7 @@ pub fn draw_game(c: &mut Canvas, g: &Game, input: &Input) {
         }
     }
     if let Some(d0) = g.drag {
-        if (input.mouse.0 - d0.0).abs() + (input.mouse.1 - d0.1).abs() > 8.0 {
+        if (input.mouse.0 - d0.0).abs() + (input.mouse.1 - d0.1).abs() > input.drag_slop() {
             let (x0, y0) = (d0.0.min(input.mouse.0), d0.1.min(input.mouse.1));
             let (w, h) = ((d0.0 - input.mouse.0).abs(), (d0.1 - input.mouse.1).abs());
             c.rect(x0, y0, w, h, FACTION_COLORS[0], 0.10);
@@ -480,12 +480,13 @@ pub fn draw_ui(c: &mut Canvas, g: &mut Game, input: &Input) -> Option<UiAction> 
     let sim = &g.sim;
 
     // ------------------------------------------------------------------ top-left info
-    c.rect(0.0, 0.0, 330.0, 74.0, [8, 10, 22], 0.6);
+    c.rect(0.0, 0.0, if input.touch_mode { 360.0 } else { 330.0 }, 74.0, [8, 10, 22], 0.6);
     c.text(10.0, 8.0, &format!("{} - {}", g.entry.constellation, g.entry.name), 2, WHITE, 1.0);
     let secs = g.seconds() as u32;
     c.text(10.0, 30.0, &format!("time {:02}:{:02}   AI level {}   x{}{}", secs / 60, secs % 60, g.entry.difficulty, g.speed, if g.paused { "  PAUSED" } else { "" }), 1, [180, 190, 220], 1.0);
     c.text(10.0, 44.0, &format!("send {}%{}   selected {}", g.percent, if g.repeat { " (repeat)" } else { "" }, g.selection.len()), 1, [180, 190, 220], 1.0);
-    c.text(10.0, 58.0, "RMB/click target: order   drag: lasso   F1: help", 1, [120, 130, 160], 1.0);
+    let hint = if input.touch_mode { "tap sun: select  tap target: send  drag: pan/lasso" } else { "RMB/click target: order   drag: lasso   F1: help" };
+    c.text(10.0, 58.0, hint, 1, [120, 130, 160], 1.0);
 
     // ------------------------------------------------------------------ top-right faction table
     let n = sim.faction_count();
@@ -508,45 +509,58 @@ pub fn draw_ui(c: &mut Canvas, g: &mut Game, input: &Input) -> Option<UiAction> 
     // ------------------------------------------------------------------ toast
     if let Some((msg, _)) = &g.toast {
         let w = Canvas::text_width(msg, 2) as f32 + 24.0;
-        c.rect(view.0 / 2.0 - w / 2.0, view.1 - BAR_H - 44.0, w, 30.0, [10, 14, 30], 0.85);
-        c.text_centered(view.0 / 2.0, view.1 - BAR_H - 36.0, msg, 2, WHITE, 1.0);
+        c.rect(view.0 / 2.0 - w / 2.0, view.1 - g.bar_h - 44.0, w, 30.0, [10, 14, 30], 0.85);
+        c.text_centered(view.0 / 2.0, view.1 - g.bar_h - 36.0, msg, 2, WHITE, 1.0);
     }
 
     // ------------------------------------------------------------------ bottom bar
-    let by = view.1 - BAR_H;
-    c.rect(0.0, by, view.0, BAR_H, [12, 16, 30], 0.96);
+    let by = view.1 - g.bar_h;
+    c.rect(0.0, by, view.0, g.bar_h, [12, 16, 30], 0.96);
     c.rect(0.0, by, view.0, 1.0, [70, 85, 120], 1.0);
-    let (bh, y) = (30.0, by + 7.0);
+    let (bh, y) = (g.bar_h - 14.0, by + 7.0);
+    // (label, base width, active, gap before). Buttons shrink uniformly when the screen is too narrow (phone portrait).
+    let pause = if g.paused { "Play" } else { "Pause" };
+    let speed = format!("x{}", g.speed);
+    let items: [(&str, f32, bool, f32); 9] = [
+        ("25%", 58.0, g.percent == 25, 0.0),
+        ("50%", 58.0, g.percent == 50, 4.0),
+        ("100%", 58.0, g.percent == 100, 4.0),
+        ("Repeat", 80.0, g.repeat, 14.0),
+        ("Cancel", 80.0, false, 4.0),
+        (pause, 70.0, g.paused, 14.0),
+        (&speed, 46.0, g.speed > 1, 4.0),
+        ("Fit", 50.0, false, 4.0),
+        ("All", 50.0, false, 4.0),
+    ];
+    let menu_w = 80.0;
+    let avail = view.0 - 16.0 - menu_w - 8.0;
+    let need: f32 = items.iter().map(|i| i.1 + i.3).sum();
+    let f = (avail / need).min(1.0);
     let mut x = 8.0;
-    for (label, p) in [("25%", 25u8), ("50%", 50), ("100%", 100)] {
-        if button(c, input, x, y, 58.0, bh, label, g.percent == p) {
-            g.percent = p;
+    for (n, (label, w, active, gap)) in items.iter().enumerate() {
+        x += gap * f;
+        if button(c, input, x, y, w * f, bh, label, *active) {
+            match n {
+                0 => g.percent = 25,
+                1 => g.percent = 50,
+                2 => g.percent = 100,
+                3 => g.repeat = !g.repeat,
+                4 => {
+                    if !g.selection.is_empty() {
+                        let sel = g.selection.clone();
+                        g.cmds.push(au2_sim::Command::Cancel { faction: 0, sources: sel });
+                        g.toast("standing orders cancelled");
+                    }
+                }
+                5 => g.paused = !g.paused,
+                6 => g.speed = if g.speed >= 4 { 1 } else { g.speed * 2 },
+                7 => g.fit(view),
+                _ => g.selection = g.own_sun_ids(),
+            }
         }
-        x += 62.0;
+        x += w * f;
     }
-    x += 10.0;
-    if button(c, input, x, y, 90.0, bh, "Repeat", g.repeat) {
-        g.repeat = !g.repeat;
-    }
-    x += 94.0;
-    if button(c, input, x, y, 90.0, bh, "Cancel", false) && !g.selection.is_empty() {
-        let sel = g.selection.clone();
-        g.cmds.push(au2_sim::Command::Cancel { faction: 0, sources: sel });
-        g.toast("standing orders cancelled");
-    }
-    x += 104.0;
-    if button(c, input, x, y, 80.0, bh, if g.paused { "Play" } else { "Pause" }, g.paused) {
-        g.paused = !g.paused;
-    }
-    x += 84.0;
-    if button(c, input, x, y, 50.0, bh, &format!("x{}", g.speed), g.speed > 1) {
-        g.speed = if g.speed >= 4 { 1 } else { g.speed * 2 };
-    }
-    x += 64.0;
-    if button(c, input, x, y, 60.0, bh, "Fit", false) {
-        g.fit(view);
-    }
-    if button(c, input, view.0 - 98.0, y, 90.0, bh, "Menu", false) {
+    if button(c, input, view.0 - menu_w - 8.0, y, menu_w, bh, "Menu", false) {
         g.overlay = Overlay::Pause;
     }
 
@@ -554,8 +568,11 @@ pub fn draw_ui(c: &mut Canvas, g: &mut Game, input: &Input) -> Option<UiAction> 
     let decided = g.sim.status != Status::Playing;
     if decided || g.overlay == Overlay::Pause {
         c.rect(0.0, 0.0, view.0, view.1, [0, 0, 8], 0.55);
-        let (pw, ph) = (360.0, if decided { 250.0 } else { 300.0 });
-        let (px, py) = (view.0 / 2.0 - pw / 2.0, view.1 / 2.0 - ph / 2.0);
+        let (pw, bh) = (360.0_f32.min(view.0 - 10.0), if input.touch_mode { 44.0 } else { 34.0 });
+        let pitch = bh + 10.0;
+        let rows = if decided { 2.0 + if g.sim.status == Status::Won { 1.0 } else { 0.0 } } else { 4.0 };
+        let ph = 100.0 + rows * pitch;
+        let (px, py) = (view.0 / 2.0 - pw / 2.0, (view.1 / 2.0 - ph / 2.0).max(0.0));
         c.rect(px, py, pw, ph, [14, 18, 36], 0.97);
         c.rect_outline(px, py, pw, ph, [90, 110, 160], 1.0);
         let (title, tcol): (&str, Rgb) = match (decided, g.sim.status) {
@@ -567,29 +584,29 @@ pub fn draw_ui(c: &mut Canvas, g: &mut Game, input: &Input) -> Option<UiAction> 
         let mut by = py + 80.0;
         let bx = px + 40.0;
         let bw = pw - 80.0;
-        if !decided && button(c, input, bx, by, bw, 34.0, "Resume", false) {
+        if !decided && button(c, input, bx, by, bw, bh, "Resume", false) {
             action = Some(UiAction::Resume);
         }
         if !decided {
-            by += 44.0;
+            by += pitch;
         }
-        if decided && g.sim.status == Status::Won && g.level_index + 1 < usize::MAX && button(c, input, bx, by, bw, 34.0, "Next level", false) {
+        if decided && g.sim.status == Status::Won && g.level_index + 1 < usize::MAX && button(c, input, bx, by, bw, bh, "Next level", false) {
             action = Some(UiAction::Next);
         }
         if decided && g.sim.status == Status::Won {
-            by += 44.0;
+            by += pitch;
         }
-        if button(c, input, bx, by, bw, 34.0, "Restart level", false) {
+        if button(c, input, bx, by, bw, bh, "Restart level", false) {
             action = Some(UiAction::Restart);
         }
-        by += 44.0;
+        by += pitch;
         if !decided {
-            if button(c, input, bx, by, bw, 34.0, "Surrender", false) {
+            if button(c, input, bx, by, bw, bh, "Surrender", false) {
                 action = Some(UiAction::Surrender);
             }
-            by += 44.0;
+            by += pitch;
         }
-        if button(c, input, bx, by, bw, 34.0, "Level select", false) {
+        if button(c, input, bx, by, bw, bh, "Level select", false) {
             action = Some(UiAction::Levels);
         }
     }

@@ -4,6 +4,14 @@ edition.workspace = true
 version.workspace = true
 description = "Playable windowed front-end for the Aurora RTS (winit + softbuffer, software rendered)"
 
+[lib]
+name = "au2_app"
+path = "src/lib.rs"
+
+[[bin]]
+name = "au2-app"
+path = "src/main.rs"
+
 [dependencies]
 au2-map = { path = "../au2-map" }
 au2-sim = { path = "../au2-sim" }

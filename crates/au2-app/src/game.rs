@@ -21,9 +21,25 @@ pub struct Input {
     pub wheel: f32,
     pub pressed: Vec<KeyCode>,
     pub down: HashSet<KeyCode>,
+    /// Touch front end: bigger hit targets, no hover cursor.
+    pub touch_mode: bool,
+    /// Pinch zoom factor accumulated this frame (0 = none), anchored at `mouse`.
+    pub pinch: f32,
+    /// Camera pan accumulated this frame, in screen pixels (finger movement).
+    pub pan_px: (f32, f32),
+    /// A second finger landed: abandon the lasso in progress.
+    pub cancel_drag: bool,
 }
 
 impl Input {
+    /// Movement (px) beyond which a press-release is a lasso rather than a click.
+    pub fn drag_slop(&self) -> f32 {
+        if self.touch_mode {
+            14.0
+        } else {
+            8.0
+        }
+    }
     pub fn key(&self, k: KeyCode) -> bool {
         self.pressed.contains(&k)
     }
@@ -41,6 +57,9 @@ impl Input {
         self.left_released = false;
         self.right_pressed = false;
         self.wheel = 0.0;
+        self.pinch = 0.0;
+        self.pan_px = (0.0, 0.0);
+        self.cancel_drag = false;
         self.pressed.clear();
     }
 }
@@ -87,6 +106,8 @@ pub struct Game {
     /// Events produced this frame (for audio); drained by the caller.
     pub events: Vec<Event>,
     pub orders_sent: u32,
+    /// Height of the bottom bar in canvas pixels (taller for touch).
+    pub bar_h: f32,
 }
 
 fn cfg(seed: u64, entry: &LevelEntry) -> SimConfig {
@@ -120,6 +141,7 @@ impl Game {
             cmds: Vec::new(),
             events: Vec::new(),
             orders_sent: 0,
+            bar_h: BAR_H,
         };
         g.fit(view);
         g
@@ -161,16 +183,16 @@ impl Game {
             (x0, x1, y0, y1) = (-5000.0, 5000.0, -5000.0, 5000.0);
         }
         self.cam = [(x0 + x1) / 2.0, (y0 + y1) / 2.0];
-        let (vw, vh) = (view.0.max(100.0), (view.1 - BAR_H).max(100.0));
+        let (vw, vh) = (view.0.max(100.0), (view.1 - self.bar_h).max(100.0));
         self.zoom = (vw / (x1 - x0)).min(vh / (y1 - y0)) * 0.95;
     }
 
     pub fn to_screen(&self, p: Vec2, view: (f32, f32)) -> (f32, f32) {
-        (view.0 / 2.0 + (p.x as f32 - self.cam[0]) * self.zoom, (view.1 - BAR_H) / 2.0 - (p.y as f32 - self.cam[1]) * self.zoom)
+        (view.0 / 2.0 + (p.x as f32 - self.cam[0]) * self.zoom, (view.1 - self.bar_h) / 2.0 - (p.y as f32 - self.cam[1]) * self.zoom)
     }
 
     pub fn to_world(&self, s: (f32, f32), view: (f32, f32)) -> Vec2 {
-        Vec2::new(((s.0 - view.0 / 2.0) / self.zoom + self.cam[0]) as f64, (((view.1 - BAR_H) / 2.0 - s.1) / self.zoom + self.cam[1]) as f64)
+        Vec2::new(((s.0 - view.0 / 2.0) / self.zoom + self.cam[0]) as f64, (((view.1 - self.bar_h) / 2.0 - s.1) / self.zoom + self.cam[1]) as f64)
     }
 
     pub fn toast(&mut self, s: impl Into<String>) {
@@ -182,7 +204,16 @@ impl Game {
     }
 
     pub fn in_bar(&self, mouse: (f32, f32), view: (f32, f32)) -> bool {
-        mouse.1 >= view.1 - BAR_H
+        mouse.1 >= view.1 - self.bar_h
+    }
+
+    /// Zoom by `factor` keeping the world point under screen position `at` fixed.
+    pub fn zoom_at(&mut self, at: (f32, f32), factor: f32, view: (f32, f32)) {
+        let before = self.to_world(at, view);
+        self.zoom = (self.zoom * factor).clamp(0.01, 0.6);
+        let after = self.to_world(at, view);
+        self.cam[0] += (before.x - after.x) as f32;
+        self.cam[1] += (before.y - after.y) as f32;
     }
 
     pub fn issue_order(&mut self, target: Target) {
@@ -292,11 +323,18 @@ impl Game {
         if !modal {
             // zoom around the cursor
             if input.wheel != 0.0 && !over_bar {
-                let before = self.to_world(input.mouse, view);
-                self.zoom = (self.zoom * (1.0 + 0.15 * input.wheel.clamp(-3.0, 3.0))).clamp(0.01, 0.6);
-                let after = self.to_world(input.mouse, view);
-                self.cam[0] += (before.x - after.x) as f32;
-                self.cam[1] += (before.y - after.y) as f32;
+                self.zoom_at(input.mouse, 1.0 + 0.15 * input.wheel.clamp(-3.0, 3.0), view);
+            }
+            // touch: pinch zoom and finger pan
+            if input.pinch > 0.0 {
+                self.zoom_at(input.mouse, input.pinch, view);
+            }
+            if input.pan_px != (0.0, 0.0) {
+                self.cam[0] -= input.pan_px.0 / self.zoom;
+                self.cam[1] += input.pan_px.1 / self.zoom;
+            }
+            if input.cancel_drag {
+                self.drag = None;
             }
             // middle-drag pans
             if input.middle_down {
@@ -312,7 +350,8 @@ impl Game {
             }
 
             let wp = self.to_world(input.mouse, view);
-            let slack = (6.0 / self.zoom) as f64;
+            // fingers are fat: a more generous pick radius for touch
+            let slack = ((if input.touch_mode { 22.0 } else { 6.0 }) / self.zoom) as f64;
             // right click = order
             if input.right_pressed && !over_bar {
                 let t = match self.sim.pick(wp, slack) {
@@ -328,7 +367,7 @@ impl Game {
             if input.left_released {
                 if let Some(start) = self.drag.take() {
                     let moved = (input.mouse.0 - start.0).abs() + (input.mouse.1 - start.1).abs();
-                    if moved > 8.0 {
+                    if moved > input.drag_slop() {
                         // lasso: own suns inside the rectangle
                         let (x0, x1) = (start.0.min(input.mouse.0), start.0.max(input.mouse.0));
                         let (y0, y1) = (start.1.min(input.mouse.1), start.1.max(input.mouse.1));
@@ -352,6 +391,11 @@ impl Game {
                     } else {
                         let wp0 = self.to_world(start, view);
                         match self.sim.pick(wp0, slack) {
+                            // touch has no right button: tapping a sun that is already selected sends the selection
+                            // to it (the way to upgrade / reinforce a sun from its own stock)
+                            Some(i) if input.touch_mode && self.selection.contains(&i) && self.sim.sun(i).map(|s| s.faction == 0 && s.present()).unwrap_or(false) => {
+                                self.issue_order(Target::Obj(i))
+                            }
                             Some(i) if self.sim.sun(i).map(|s| s.faction == 0 && s.present()).unwrap_or(false) => {
                                 if input.shift() {
                                     if let Some(k) = self.selection.iter().position(|&x| x == i) {
