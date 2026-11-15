@@ -19,4 +19,4 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: ./.github/actions/android-setup
-      - run: tools/build-android.sh "$RUNNER_TEMP/aurora-ci.apk"
+      - run: bash tools/build-android.sh "$RUNNER_TEMP/aurora-ci.apk"
