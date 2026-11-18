@@ -468,8 +468,10 @@ impl Game {
             }
             if input.left_released {
                 if let Some(start) = self.drag.take() {
-                    let moved = (input.mouse.0 - start.0).abs() + (input.mouse.1 - start.1).abs();
+                    // how far the drag ever got from where it began (a closed lasso ends where it started)
                     let path = std::mem::take(&mut self.lasso);
+                    let reach = path.iter().map(|p| p.dist(path[0])).fold(0.0f64, f64::max) * self.zoom as f64;
+                    let moved = ((input.mouse.0 - start.0).abs() + (input.mouse.1 - start.1).abs()).max(reach as f32);
                     if moved > input.drag_slop() {
                         let mut path = path;
                         path.push(wp);
@@ -554,6 +556,71 @@ mod tests {
         let (c, r) = lasso_circle(&path).unwrap();
         assert!(c.dist(Vec2::new(100.0, 50.0)) < 1.0 && (r - 300.0).abs() < 1.0);
         assert!(lasso_circle(&path[..2]).is_none());
+    }
+
+    fn level(stem: &str) -> Game {
+        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../levels");
+        let e = au2_map::load_index(&dir).unwrap().into_iter().find(|e| e.stem == stem).unwrap();
+        let map = au2_map::load_level(&dir, &e).unwrap();
+        Game::new(e, 0, map, 1, (1280.0, 800.0))
+    }
+
+    /// One frame of input: press / move / release at screen points.
+    fn frame(g: &mut Game, f: impl FnOnce(&mut Input)) {
+        let mut i = Input::default();
+        f(&mut i);
+        g.update(&i, 0.0, (1280.0, 800.0));
+    }
+
+    #[test]
+    fn lasso_selects_ships_and_a_click_sends_them() {
+        let view = (1280.0, 800.0);
+        let mut g = level("dawn_twin");
+        let home = g.own_sun_ids()[0];
+        let c = g.to_screen(g.sim.sun(home).unwrap().pos, view);
+        let r = 70.0; // screen px, more than the cloud at the fitted zoom
+        frame(&mut g, |i| {
+            i.mouse = (c.0 + r, c.1);
+            i.left_pressed = true;
+            i.left_down = true;
+        });
+        for k in 1..=24 {
+            let a = k as f32 / 24.0 * std::f32::consts::TAU;
+            frame(&mut g, |i| {
+                i.mouse = (c.0 + r * a.cos(), c.1 + r * a.sin());
+                i.left_down = true;
+            });
+        }
+        frame(&mut g, |i| {
+            i.mouse = (c.0 + r, c.1);
+            i.left_released = true;
+        });
+        assert_eq!(g.selection.len(), 100, "the whole starting cloud");
+        // click a neutral sun: the order is queued and the selection cleared
+        let target = g.sim.suns().find(|(_, s)| s.faction < 0).map(|(i, _)| i).unwrap();
+        let t = g.to_screen(g.sim.sun(target).unwrap().pos, view);
+        frame(&mut g, |i| {
+            i.mouse = t;
+            i.left_pressed = true;
+            i.left_released = true;
+        });
+        assert!(g.selection.is_empty());
+        assert!(matches!(&g.cmds[..], [Command::Order { ships, target: Target::Obj(x), .. }] if ships.len() == 100 && *x == target));
+    }
+
+    #[test]
+    fn clicking_a_sun_with_nothing_selected_selects_its_area() {
+        let view = (1280.0, 800.0);
+        let mut g = level("dawn_twin");
+        let home = g.own_sun_ids()[0];
+        let c = g.to_screen(g.sim.sun(home).unwrap().pos, view);
+        frame(&mut g, |i| {
+            i.mouse = c;
+            i.left_pressed = true;
+            i.left_released = true;
+        });
+        assert_eq!(g.selection.len(), 100);
+        assert!(g.cmds.is_empty());
     }
 
     #[test]
