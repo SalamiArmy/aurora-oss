@@ -206,16 +206,11 @@ impl App {
         self.last = Instant::now();
     }
 
-    /// Where does a new touch land? `(on one of your suns, on UI/menu/overlay)`
-    fn touch_target(&self, p: (f32, f32)) -> (bool, bool) {
-        let State::Play(g) = &self.state else { return (false, true) };
+    /// Does a new touch land on the bottom bar, a menu or an overlay?
+    fn touch_in_ui(&self, p: (f32, f32)) -> bool {
+        let State::Play(g) = &self.state else { return true };
         let view = (self.canvas.w as f32, self.canvas.h as f32);
-        let in_ui = g.in_bar(p, view) || g.overlay != Overlay::None || g.sim.status != Status::Playing;
-        if in_ui {
-            return (false, true);
-        }
-        let own = g.sim.pick(g.to_world(p, view), (22.0 / g.zoom) as f64).and_then(|i| g.sim.sun(i)).is_some_and(|s| s.faction == 0 && s.present());
-        (own, false)
+        g.in_bar(p, view) || g.overlay != Overlay::None || g.sim.status != Status::Playing
     }
 }
 
@@ -344,8 +339,8 @@ impl ApplicationHandler for App {
                     TouchPhase::Ended => Phase::Ended,
                     TouchPhase::Cancelled => Phase::Cancelled,
                 };
-                let (on_sun, in_ui) = if phase == Phase::Started { self.touch_target(pos) } else { (false, false) };
-                self.touch.event(phase, t.id, pos, &mut self.input, on_sun, in_ui);
+                let in_ui = phase == Phase::Started && self.touch_in_ui(pos);
+                self.touch.event(phase, t.id, pos, &mut self.input, in_ui);
             }
             WindowEvent::CursorMoved { position, .. } => {
                 self.input.mouse = (position.x as f32 / s, position.y as f32 / s);

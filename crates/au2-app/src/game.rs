@@ -1,9 +1,12 @@
 //! Game session state and input handling (no drawing here).
+//!
+//! Orders select **ships by area**: draw a circle (lasso) or tap a sun to select the area around it, then tap a target.
+//! The selection is a set of ship ids (circling, hovering and flying ships alike); it is cleared once an order is sent.
 
 use au2_map::{LevelEntry, Map, Object};
 use au2_sim::math::Vec2;
 use au2_sim::rules::TICKS_PER_SEC;
-use au2_sim::{Command, Event, Obj, OrderError, Sim, SimConfig, Status, Target};
+use au2_sim::{Command, Event, OrderError, Sim, SimConfig, Status, Target};
 use std::collections::HashSet;
 use winit::keyboard::KeyCode;
 
@@ -75,10 +78,68 @@ pub struct Ping {
     pub age: f32,
 }
 
+/// A supergiant (or any sun) dying: rays and debris in the owner's colour.
+pub struct Burst {
+    pub pos: Vec2,
+    pub age: f32,
+    pub faction: i8,
+    pub big: bool,
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Overlay {
     None,
     Pause,
+}
+
+/// Game speeds: each roughly twice the previous; normal is the default.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Speed {
+    Slow,
+    Normal,
+    Fast,
+}
+
+impl Speed {
+    /// Simulation steps per real second.
+    pub fn ticks_per_sec(self) -> f32 {
+        match self {
+            Speed::Slow => TICKS_PER_SEC as f32 / 2.0,
+            Speed::Normal => TICKS_PER_SEC as f32,
+            Speed::Fast => TICKS_PER_SEC as f32 * 2.0,
+        }
+    }
+    pub fn label(self) -> &'static str {
+        match self {
+            Speed::Slow => "Slow",
+            Speed::Normal => "Normal",
+            Speed::Fast => "Fast",
+        }
+    }
+    pub fn next(self) -> Speed {
+        match self {
+            Speed::Slow => Speed::Normal,
+            Speed::Normal => Speed::Fast,
+            Speed::Fast => Speed::Slow,
+        }
+    }
+    pub fn faster(self) -> Speed {
+        if self == Speed::Slow { Speed::Normal } else { Speed::Fast }
+    }
+    pub fn slower(self) -> Speed {
+        if self == Speed::Fast { Speed::Normal } else { Speed::Slow }
+    }
+}
+
+/// Smallest-effort circle for a drawn lasso: centroid of the path and the mean distance of its points.
+pub fn lasso_circle(path: &[Vec2]) -> Option<(Vec2, f64)> {
+    if path.len() < 3 {
+        return None;
+    }
+    let n = path.len() as f64;
+    let c = path.iter().fold(Vec2::ZERO, |a, &p| a + p) * (1.0 / n);
+    let r = path.iter().map(|p| p.dist(c)).sum::<f64>() / n;
+    Some((c, r))
 }
 
 pub struct Game {
@@ -89,16 +150,19 @@ pub struct Game {
     pub seed: u64,
     pub cam: [f32; 2],
     pub zoom: f32,
-    pub selection: Vec<usize>,
-    pub percent: u8,
-    pub repeat: bool,
-    pub speed: u32,
+    /// Selected ship ids (sorted).
+    pub selection: Vec<u32>,
+    pub speed: Speed,
     pub paused: bool,
     pub overlay: Overlay,
     pub sparks: Vec<Spark>,
     pub pings: Vec<Ping>,
+    pub bursts: Vec<Burst>,
     pub toast: Option<(String, f32)>,
+    /// Screen position where the current press began.
     pub drag: Option<(f32, f32)>,
+    /// The lasso being drawn (world points).
+    pub lasso: Vec<Vec2>,
     pan: Option<((f32, f32), [f32; 2])>,
     acc: f32,
     pub clock: f32,
@@ -126,15 +190,15 @@ impl Game {
             cam: [0.0, 0.0],
             zoom: 0.05,
             selection: Vec::new(),
-            percent: 50,
-            repeat: false,
-            speed: 1,
+            speed: Speed::Normal,
             paused: false,
             overlay: Overlay::None,
             sparks: Vec::new(),
             pings: Vec::new(),
+            bursts: Vec::new(),
             toast: None,
             drag: None,
+            lasso: Vec::new(),
             pan: None,
             acc: 0.0,
             clock: 0.0,
@@ -144,7 +208,14 @@ impl Game {
             bar_h: BAR_H,
         };
         g.fit(view);
+        g.flash_all_suns();
         g
+    }
+
+    /// All suns flash when a level starts.
+    fn flash_all_suns(&mut self) {
+        let ps: Vec<Vec2> = self.sim.suns().map(|(_, s)| s.pos).collect();
+        self.pings.extend(ps.into_iter().map(|pos| Ping { pos, age: 0.0 }));
     }
 
     pub fn restart(&mut self) {
@@ -152,11 +223,15 @@ impl Game {
         self.selection.clear();
         self.sparks.clear();
         self.pings.clear();
+        self.bursts.clear();
         self.cmds.clear();
+        self.lasso.clear();
+        self.drag = None;
         self.paused = false;
         self.overlay = Overlay::None;
         self.acc = 0.0;
         self.orders_sent = 0;
+        self.flash_all_suns();
     }
 
     /// Frame the whole board.
@@ -216,30 +291,60 @@ impl Game {
         self.cam[1] += (before.y - after.y) as f32;
     }
 
-    pub fn issue_order(&mut self, target: Target) {
-        let sources: Vec<usize> = self.selection.iter().copied().filter(|&i| self.sim.sun(i).map(|s| s.faction == 0 && s.present()).unwrap_or(false)).collect();
-        if sources.is_empty() {
-            return;
+    /// Is this ship id selected? (`selection` is sorted.)
+    pub fn is_selected(&self, id: u32) -> bool {
+        self.selection.binary_search(&id).is_ok()
+    }
+
+    /// Select (or, with `add`, add) the player's ships in a circle.
+    pub fn select_circle(&mut self, c: Vec2, r: f64, add: bool) {
+        let ids = self.sim.ships_in_circle(0, c, r);
+        if add {
+            self.selection.extend(ids);
+            self.selection.sort_unstable();
+            self.selection.dedup();
+        } else {
+            self.selection = ids;
         }
-        let cmd = Command::Order { faction: 0, sources, target, then: None, percent: self.percent, repeat: self.repeat };
-        // validate right now so the player gets immediate feedback; the sim re-validates when it applies it
-        let mut probe_ok = true;
-        if let Command::Order { sources, .. } = &cmd {
-            if sources.len() > self.sim.factions[0].max_sources as usize {
-                self.toast(format!("at most {} suns per order", self.sim.factions[0].max_sources));
-                probe_ok = false;
-            }
-        }
-        if probe_ok {
-            self.cmds.push(cmd);
-            self.orders_sent += 1;
-            if let Some(p) = self.sim.target_pos(target) {
-                self.pings.push(Ping { pos: p, age: 0.0 });
-            }
+        if self.selection.is_empty() {
+            self.toast("no ships of yours there");
         }
     }
 
-    /// Process one frame of input. Returns true if the world consumed a click (used by the caller for UI gating).
+    pub fn select_all(&mut self) {
+        self.selection = self.sim.all_ships(0);
+    }
+
+    pub fn issue_order(&mut self, target: Target) {
+        if self.selection.is_empty() {
+            return;
+        }
+        let ships = std::mem::take(&mut self.selection);
+        self.cmds.push(Command::Order { faction: 0, ships, target });
+        self.orders_sent += 1;
+        if let Some(p) = self.sim.target_pos(target) {
+            self.pings.push(Ping { pos: p, age: 0.0 });
+        }
+    }
+
+    /// A click / tap at world point `wp` (no drag).
+    fn click(&mut self, wp: Vec2, slack: f64, shift: bool) {
+        let picked = self.sim.pick(wp, slack);
+        if self.selection.is_empty() || shift {
+            // select the area around a sun (of any owner)
+            if let Some(i) = picked.filter(|&i| self.sim.sun(i).is_some()) {
+                let (c, r) = (self.sim.sun(i).unwrap().pos, self.sim.sun_select_radius(i));
+                self.select_circle(c, r, shift);
+            }
+            return;
+        }
+        match picked {
+            Some(i) => self.issue_order(Target::Obj(i)),
+            None => self.issue_order(Target::Point(wp)),
+        }
+    }
+
+    /// Process one frame of input and advance the simulation.
     pub fn update(&mut self, input: &Input, dt: f32, view: (f32, f32)) {
         self.clock += dt;
         for s in self.sparks.iter_mut() {
@@ -250,6 +355,10 @@ impl Game {
             p.age += dt;
         }
         self.pings.retain(|p| p.age < 0.8);
+        for b in self.bursts.iter_mut() {
+            b.age += dt;
+        }
+        self.bursts.retain(|b| b.age < 1.6);
         if let Some((_, t)) = &mut self.toast {
             *t -= dt;
             if *t <= 0.0 {
@@ -259,44 +368,30 @@ impl Game {
 
         // ---- keyboard (always available)
         if input.key(KeyCode::Escape) {
-            self.overlay = if self.overlay == Overlay::Pause { Overlay::None } else { Overlay::Pause };
+            if self.overlay == Overlay::None && (!self.selection.is_empty() || !self.lasso.is_empty()) {
+                self.selection.clear();
+                self.lasso.clear();
+                self.drag = None;
+            } else {
+                self.overlay = if self.overlay == Overlay::Pause { Overlay::None } else { Overlay::Pause };
+            }
         }
         let decided = self.sim.status != Status::Playing;
         if self.overlay == Overlay::None {
             if input.key(KeyCode::Space) || input.key(KeyCode::KeyP) {
                 self.paused = !self.paused;
             }
-            if input.key(KeyCode::Digit1) {
-                self.percent = 25;
-            }
-            if input.key(KeyCode::Digit2) {
-                self.percent = 50;
-            }
-            if input.key(KeyCode::Digit3) {
-                self.percent = 100;
-            }
-            if input.key(KeyCode::KeyT) {
-                self.repeat = !self.repeat;
-                self.toast(if self.repeat { "repeat orders ON" } else { "repeat orders off" });
-            }
-            if input.key(KeyCode::KeyX) {
-                let sel = self.selection.clone();
-                if !sel.is_empty() {
-                    self.cmds.push(Command::Cancel { faction: 0, sources: sel });
-                    self.toast("standing orders cancelled");
-                }
-            }
             if input.key(KeyCode::KeyA) && input.ctrl() {
-                self.selection = self.own_sun_ids();
+                self.select_all();
             }
             if input.key(KeyCode::KeyF) || input.key(KeyCode::Home) {
                 self.fit(view);
             }
             if input.key(KeyCode::Equal) || input.key(KeyCode::NumpadAdd) {
-                self.speed = (self.speed * 2).min(8);
+                self.speed = self.speed.faster();
             }
             if input.key(KeyCode::Minus) || input.key(KeyCode::NumpadSubtract) {
-                self.speed = (self.speed / 2).max(1);
+                self.speed = self.speed.slower();
             }
             // camera pan
             let pan = 900.0 / self.zoom * dt;
@@ -317,15 +412,13 @@ impl Game {
             self.cam[1] += dy;
         }
 
-        // ---- mouse (world)
+        // ---- mouse / touch (world)
         let modal = self.overlay != Overlay::None || decided;
         let over_bar = self.in_bar(input.mouse, view);
         if !modal {
-            // zoom around the cursor
             if input.wheel != 0.0 && !over_bar {
                 self.zoom_at(input.mouse, 1.0 + 0.15 * input.wheel.clamp(-3.0, 3.0), view);
             }
-            // touch: pinch zoom and finger pan
             if input.pinch > 0.0 {
                 self.zoom_at(input.mouse, input.pinch, view);
             }
@@ -335,8 +428,8 @@ impl Game {
             }
             if input.cancel_drag {
                 self.drag = None;
+                self.lasso.clear();
             }
-            // middle-drag pans
             if input.middle_down {
                 match self.pan {
                     None => self.pan = Some((input.mouse, self.cam)),
@@ -350,116 +443,123 @@ impl Game {
             }
 
             let wp = self.to_world(input.mouse, view);
-            // fingers are fat: a more generous pick radius for touch
             let slack = ((if input.touch_mode { 22.0 } else { 6.0 }) / self.zoom) as f64;
-            // right click = order
+            // right click = order (or nothing without a selection)
             if input.right_pressed && !over_bar {
-                let t = match self.sim.pick(wp, slack) {
-                    Some(i) => Target::Obj(i),
-                    None => Target::Point(wp),
-                };
-                self.issue_order(t);
+                if self.selection.is_empty() {
+                    self.click(wp, slack, false);
+                } else {
+                    let t = match self.sim.pick(wp, slack) {
+                        Some(i) => Target::Obj(i),
+                        None => Target::Point(wp),
+                    };
+                    self.issue_order(t);
+                }
             }
-            // left press begins a click / lasso
+            // left press begins a click or a lasso
             if input.left_pressed && !over_bar {
                 self.drag = Some(input.mouse);
+                self.lasso = vec![wp];
+            }
+            if self.drag.is_some() && input.left_down {
+                if self.lasso.last().map(|l| l.dist(wp) * self.zoom as f64 > 4.0).unwrap_or(true) {
+                    self.lasso.push(wp);
+                }
             }
             if input.left_released {
                 if let Some(start) = self.drag.take() {
                     let moved = (input.mouse.0 - start.0).abs() + (input.mouse.1 - start.1).abs();
+                    let path = std::mem::take(&mut self.lasso);
                     if moved > input.drag_slop() {
-                        // lasso: own suns inside the rectangle
-                        let (x0, x1) = (start.0.min(input.mouse.0), start.0.max(input.mouse.0));
-                        let (y0, y1) = (start.1.min(input.mouse.1), start.1.max(input.mouse.1));
-                        let inside: Vec<usize> = self
-                            .own_sun_ids()
-                            .into_iter()
-                            .filter(|&i| {
-                                let p = self.to_screen(self.sim.sun(i).unwrap().pos, view);
-                                p.0 >= x0 && p.0 <= x1 && p.1 >= y0 && p.1 <= y1
-                            })
-                            .collect();
-                        if input.shift() {
-                            for i in inside {
-                                if !self.selection.contains(&i) {
-                                    self.selection.push(i);
-                                }
-                            }
-                        } else {
-                            self.selection = inside;
+                        let mut path = path;
+                        path.push(wp);
+                        if let Some((c, r)) = lasso_circle(&path) {
+                            self.select_circle(c, r, input.shift());
                         }
                     } else {
                         let wp0 = self.to_world(start, view);
-                        match self.sim.pick(wp0, slack) {
-                            // touch has no right button: tapping a sun that is already selected sends the selection
-                            // to it (the way to upgrade / reinforce a sun from its own stock)
-                            Some(i) if input.touch_mode && self.selection.contains(&i) && self.sim.sun(i).map(|s| s.faction == 0 && s.present()).unwrap_or(false) => {
-                                self.issue_order(Target::Obj(i))
-                            }
-                            Some(i) if self.sim.sun(i).map(|s| s.faction == 0 && s.present()).unwrap_or(false) => {
-                                if input.shift() {
-                                    if let Some(k) = self.selection.iter().position(|&x| x == i) {
-                                        self.selection.remove(k);
-                                    } else {
-                                        self.selection.push(i);
-                                    }
-                                } else {
-                                    self.selection = vec![i];
-                                }
-                            }
-                            Some(i) if !self.selection.is_empty() => self.issue_order(Target::Obj(i)),
-                            None if !self.selection.is_empty() => self.issue_order(Target::Point(wp0)),
-                            _ => {}
-                        }
+                        self.click(wp0, slack, input.shift());
                     }
                 }
             }
         } else {
             self.drag = None;
+            self.lasso.clear();
         }
 
-        // ---- simulation stepping
-        self.selection.retain(|&i| self.sim.sun(i).map(|s| s.faction == 0 && s.present()).unwrap_or(false));
+        // ---- simulation stepping (the speed scales how many fixed steps run per real second)
         if !self.paused && self.overlay == Overlay::None && self.sim.status == Status::Playing {
-            self.acc += dt.min(0.1) * self.speed as f32;
-            let tick = 1.0 / TICKS_PER_SEC as f32;
+            self.acc += dt.min(0.1) * self.speed.ticks_per_sec();
             let mut n = 0;
-            while self.acc >= tick && n < 16 && self.sim.status == Status::Playing {
+            while self.acc >= 1.0 && n < 16 && self.sim.status == Status::Playing {
                 let cmds = std::mem::take(&mut self.cmds);
                 self.sim.step(&cmds);
-                self.acc -= tick;
+                self.acc -= 1.0;
                 n += 1;
-                for ev in self.sim.take_events() {
-                    match &ev {
-                        Event::Combat { pos, a, .. } => {
-                            if self.sparks.len() < 400 {
-                                self.sparks.push(Spark { pos: *pos, age: 0.0, color_faction: *a });
-                            }
-                        }
-                        Event::OrderRejected { faction: 0, why } => {
-                            let m = match why {
-                                OrderError::TooManyOrders => "too many orders at once - wait a moment",
-                                OrderError::TooManyRepeats => "too many standing repeat orders",
-                                OrderError::NoShips => "no ships to send",
-                                OrderError::TooManySources => "too many suns in one order",
-                                _ => "order not possible",
-                            };
-                            self.toast = Some((m.to_string(), 2.0));
-                        }
-                        _ => {}
-                    }
-                    self.events.push(ev);
-                }
+                let events = self.sim.take_events();
+                self.handle_events(events);
             }
-            if self.acc > tick * 16.0 {
+            if self.acc > 16.0 {
                 self.acc = 0.0;
+            }
+            // ships that died drop out of the selection
+            if !self.selection.is_empty() {
+                let sim = &self.sim;
+                self.selection.retain(|&id| sim.ship_index(id).is_some());
             }
         }
         // orders given while paused still apply when the game resumes (kept in `cmds`)
-        let _ = Obj::Fog; // keep the import used when features change
+    }
+
+    pub fn handle_events(&mut self, events: Vec<Event>) {
+        for ev in events {
+            match &ev {
+                Event::Combat { pos, a, .. } => {
+                    if self.sparks.len() < 400 {
+                        self.sparks.push(Spark { pos: *pos, age: 0.0, color_faction: *a });
+                    }
+                }
+                Event::SunDied { sun, faction, level } => {
+                    if let Some(s) = self.sim.sun(*sun) {
+                        self.bursts.push(Burst { pos: s.pos, age: 0.0, faction: *faction, big: *level >= 4 });
+                    }
+                }
+                Event::OrderRejected { faction: 0, why } => {
+                    let m = match why {
+                        OrderError::Fogged => "you cannot see there",
+                        OrderError::NoShips => "no ships selected",
+                        OrderError::BadTarget => "not a valid target",
+                        _ => "order not possible",
+                    };
+                    self.toast = Some((m.to_string(), 2.0));
+                }
+                _ => {}
+            }
+            self.events.push(ev);
+        }
     }
 
     pub fn seconds(&self) -> f32 {
         self.sim.tick as f32 / TICKS_PER_SEC as f32
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_drawn_lasso_becomes_its_circle() {
+        let path: Vec<Vec2> = (0..36).map(|k| Vec2::new(100.0, 50.0) + au2_sim::math::dir_deg(k as f64 * 10.0) * 300.0).collect();
+        let (c, r) = lasso_circle(&path).unwrap();
+        assert!(c.dist(Vec2::new(100.0, 50.0)) < 1.0 && (r - 300.0).abs() < 1.0);
+        assert!(lasso_circle(&path[..2]).is_none());
+    }
+
+    #[test]
+    fn speeds_are_each_about_twice_the_previous() {
+        assert_eq!(Speed::Normal.ticks_per_sec(), 60.0);
+        assert_eq!(Speed::Slow.ticks_per_sec() * 2.0, Speed::Normal.ticks_per_sec());
+        assert_eq!(Speed::Fast.ticks_per_sec(), Speed::Normal.ticks_per_sec() * 2.0);
     }
 }

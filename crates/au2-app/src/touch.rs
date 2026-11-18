@@ -1,9 +1,8 @@
 //! Touch gestures, translated into the same `Input` the mouse produces so the game logic has one set of semantics.
 //!
-//! * tap = a left click (select your sun / send ships to the tapped target)
-//! * one finger dragging from one of your suns = lasso select (a left press-drag-release)
-//! * one finger dragging from anywhere else = pan the camera
-//! * two fingers = pinch zoom (and pan with the midpoint)
+//! * tap = a left click (select the area around a sun / send the selection to the tapped target)
+//! * one finger dragging = draw a lasso circle around ships to select them (a left press-drag-release)
+//! * two fingers = pan the camera and pinch zoom
 //!
 //! All coordinates are in canvas (logical) pixels.
 
@@ -22,9 +21,8 @@ enum Mode {
     Idle,
     /// Finger down, not yet decided: a tap if it lifts without moving, a pan if it moves.
     Pending,
-    /// Press already sent (started on one of your suns): follows the finger as a lasso.
+    /// Press already sent: follows the finger as a lasso (a tap if it lifts without moving).
     Select,
-    Pan,
     Pinch,
     /// Waiting for every finger to lift (a tap that turned into a drag over a button, or one finger of a pinch lifted).
     Ignored,
@@ -34,7 +32,6 @@ pub struct Touch {
     fingers: Vec<(u64, (f32, f32))>,
     mode: Mode,
     start: (f32, f32),
-    anchor: (f32, f32),
     pinch_dist: f32,
     pinch_mid: (f32, f32),
     start_in_ui: bool,
@@ -43,7 +40,7 @@ pub struct Touch {
 
 impl Default for Touch {
     fn default() -> Self {
-        Touch { fingers: Vec::new(), mode: Mode::Idle, start: (0.0, 0.0), anchor: (0.0, 0.0), pinch_dist: 1.0, pinch_mid: (0.0, 0.0), start_in_ui: false, slop: 12.0 }
+        Touch { fingers: Vec::new(), mode: Mode::Idle, start: (0.0, 0.0), pinch_dist: 1.0, pinch_mid: (0.0, 0.0), start_in_ui: false, slop: 12.0 }
     }
 }
 
@@ -57,9 +54,9 @@ impl Touch {
         !self.fingers.is_empty()
     }
 
-    /// Feed one touch event. `on_own_sun`: the first finger landed on one of the player's suns (lasso/select);
-    /// `in_ui`: it landed on the bottom bar, a menu or an overlay (tap only, never pans).
-    pub fn event(&mut self, phase: Phase, id: u64, pos: (f32, f32), input: &mut Input, on_own_sun: bool, in_ui: bool) {
+    /// Feed one touch event. `in_ui`: the first finger landed on the bottom bar, a menu or an overlay (tap only,
+    /// never draws a lasso).
+    pub fn event(&mut self, phase: Phase, id: u64, pos: (f32, f32), input: &mut Input, in_ui: bool) {
         input.touch_mode = true;
         match phase {
             Phase::Started => {
@@ -70,10 +67,9 @@ impl Touch {
                 match self.fingers.len() {
                     1 => {
                         self.start = pos;
-                        self.anchor = pos;
                         self.start_in_ui = in_ui;
                         input.mouse = pos;
-                        if on_own_sun && !in_ui {
+                        if !in_ui {
                             self.mode = Mode::Select;
                             input.left_down = true;
                             input.left_pressed = true;
@@ -102,20 +98,8 @@ impl Touch {
                     Mode::Select => input.mouse = pos,
                     Mode::Pending => {
                         if dist(pos, self.start) > self.slop {
-                            if self.start_in_ui {
-                                self.mode = Mode::Ignored;
-                            } else {
-                                self.mode = Mode::Pan;
-                                input.pan_px.0 += pos.0 - self.anchor.0;
-                                input.pan_px.1 += pos.1 - self.anchor.1;
-                                self.anchor = pos;
-                            }
+                            self.mode = Mode::Ignored;
                         }
-                    }
-                    Mode::Pan => {
-                        input.pan_px.0 += pos.0 - self.anchor.0;
-                        input.pan_px.1 += pos.1 - self.anchor.1;
-                        self.anchor = pos;
                     }
                     Mode::Pinch if self.fingers.len() >= 2 => {
                         let (a, b) = (self.fingers[0].1, self.fingers[1].1);
@@ -168,55 +152,45 @@ mod tests {
     #[test]
     fn tap_is_a_click() {
         let (mut t, mut i) = (Touch::default(), Input::default());
-        t.event(Phase::Started, 1, (50.0, 60.0), &mut i, false, false);
-        assert!(!i.left_pressed, "nothing is sent until we know it is a tap");
-        t.event(Phase::Ended, 1, (50.0, 60.0), &mut i, false, false);
-        assert!(i.left_pressed && i.left_released);
+        t.event(Phase::Started, 1, (50.0, 60.0), &mut i, false);
+        assert!(i.left_pressed);
+        t.event(Phase::Ended, 1, (50.0, 60.0), &mut i, false);
+        assert!(i.left_released);
         assert_eq!(i.mouse, (50.0, 60.0));
         assert!(i.touch_mode && !t.active());
     }
 
     #[test]
-    fn drag_from_empty_space_pans_without_clicking() {
+    fn one_finger_drag_anywhere_is_a_lasso() {
         let (mut t, mut i) = (Touch::default(), Input::default());
-        t.event(Phase::Started, 1, (100.0, 100.0), &mut i, false, false);
-        t.event(Phase::Moved, 1, (140.0, 90.0), &mut i, false, false);
-        t.event(Phase::Moved, 1, (150.0, 90.0), &mut i, false, false);
-        t.event(Phase::Ended, 1, (150.0, 90.0), &mut i, false, false);
-        assert_eq!(i.pan_px, (50.0, -10.0));
-        assert!(!i.left_pressed && !i.left_released);
-    }
-
-    #[test]
-    fn drag_from_own_sun_is_a_lasso() {
-        let (mut t, mut i) = (Touch::default(), Input::default());
-        t.event(Phase::Started, 1, (100.0, 100.0), &mut i, true, false);
+        t.event(Phase::Started, 1, (100.0, 100.0), &mut i, false);
         assert!(i.left_pressed);
-        t.event(Phase::Moved, 1, (200.0, 180.0), &mut i, true, false);
+        t.event(Phase::Moved, 1, (200.0, 180.0), &mut i, false);
         assert_eq!(i.mouse, (200.0, 180.0));
-        t.event(Phase::Ended, 1, (200.0, 180.0), &mut i, true, false);
+        t.event(Phase::Ended, 1, (200.0, 180.0), &mut i, false);
         assert!(i.left_released && i.pan_px == (0.0, 0.0));
     }
 
     #[test]
-    fn two_fingers_pinch_and_cancel_the_lasso() {
+    fn two_fingers_pan_and_pinch_and_cancel_the_lasso() {
         let (mut t, mut i) = (Touch::default(), Input::default());
-        t.event(Phase::Started, 1, (100.0, 100.0), &mut i, true, false);
-        t.event(Phase::Started, 2, (200.0, 100.0), &mut i, false, false);
+        t.event(Phase::Started, 1, (100.0, 100.0), &mut i, false);
+        t.event(Phase::Started, 2, (200.0, 100.0), &mut i, false);
         assert!(i.cancel_drag);
-        t.event(Phase::Moved, 2, (300.0, 100.0), &mut i, false, false);
+        t.event(Phase::Moved, 2, (300.0, 100.0), &mut i, false);
         assert!((i.pinch - 2.0).abs() < 1e-4, "{}", i.pinch);
-        t.event(Phase::Ended, 2, (300.0, 100.0), &mut i, false, false);
-        t.event(Phase::Ended, 1, (100.0, 100.0), &mut i, false, false);
+        assert_eq!(i.pan_px, (50.0, 0.0), "the midpoint moved: pan");
+        t.event(Phase::Ended, 2, (300.0, 100.0), &mut i, false);
+        t.event(Phase::Ended, 1, (100.0, 100.0), &mut i, false);
         assert!(!i.left_released, "lifting after a pinch is not a click");
     }
 
     #[test]
     fn bar_taps_work_but_never_pan() {
         let (mut t, mut i) = (Touch::default(), Input::default());
-        t.event(Phase::Started, 1, (10.0, 500.0), &mut i, false, true);
-        t.event(Phase::Moved, 1, (90.0, 500.0), &mut i, false, true);
-        t.event(Phase::Ended, 1, (90.0, 500.0), &mut i, false, true);
+        t.event(Phase::Started, 1, (10.0, 500.0), &mut i, true);
+        t.event(Phase::Moved, 1, (90.0, 500.0), &mut i, true);
+        t.event(Phase::Ended, 1, (90.0, 500.0), &mut i, true);
         assert!(i.pan_px == (0.0, 0.0) && !i.left_pressed);
     }
 }

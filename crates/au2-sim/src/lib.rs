@@ -4,59 +4,91 @@
 //! * No wall clock, no global RNG: all randomness comes from the seeded [`math::Rng`] stored in the sim.
 //! * No dependence on libm: see [`math`].
 //! * Object identity = index into the level's `objects` array (same as in the map crate).
+//! * Every ship is an entity in [`Sim::ships`], kept sorted by `id`; there is no hidden stock inside a sun.
+//!
+//! Module layout: this file holds the types, construction, queries, commands and the tick; `ships.rs` movement,
+//! orbits, arrival, combat, self-defence and merging; `specials.rs` the special objects; `terrain.rs` the zones;
+//! `ai.rs` the computer players.
 
 pub mod ai;
 pub mod math;
 pub mod rules;
+mod ships;
+mod specials;
+mod terrain;
 
-use au2_map::{FogDef, GammaRayDef, Map, Object, OrbitDef, ShockwaveDef, SupernovaDef, TerrainDef, TerrainKind, WhiteHoleDef};
+use au2_map::{FogDef, Map, Object, OrbitDef};
 pub use math::Vec2;
 use math::{cos_deg, dir_deg, sin_deg, Rng};
 use rules::*;
+pub use specials::{Gamma, NovaPhase, Shock, ShockShape, Supernova, WhiteHole, WhitePhase, Wormhole};
+pub use terrain::Terrain;
 
 // ------------------------------------------------------------------------------------------------ public types
-/// Where ships are going. `Obj(i)` is an index into [`Sim::objs`]; its kind decides what arriving does.
+/// Where a ship is going. `Obj(i)` is an index into [`Sim::objs`]; its kind decides what arriving does.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Target {
-    /// Idle: the ship stays where it is.
+    /// No order: the ship is idle (circling a sun or hovering).
     None,
     Obj(usize),
     Point(Vec2),
 }
 
+/// What a ship is doing right now.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Mode {
+    /// Flying towards its target.
+    Fly,
+    /// Idle, circling the sun `home` on an oval.
+    Orbit,
+    /// Idle, hovering in space.
+    Hover,
+}
+
+pub const NO_SUN: u32 = u32::MAX;
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Ship {
     pub id: u32,
     pub pos: Vec2,
-    /// Unit heading.
+    /// Unit heading (direction of the last movement).
     pub heading: Vec2,
-    /// Extra velocity from force terrain (units/tick).
+    /// Extra velocity from force terrain and blasts (units/tick).
     pub push: Vec2,
     pub faction: u8,
+    /// How many ships this dot counts as (more than 1 after merging, or for strong white-hole ships).
+    pub strength: u32,
     pub target: Target,
-    /// Where to go after passing through the wormhole this ship is currently targeting.
-    pub then: Option<Target>,
+    pub mode: Mode,
+    /// Sun being circled (object index) while `mode == Orbit`, else [`NO_SUN`].
+    pub home: u32,
+    /// Orbit oval: semi-major axis, current parameter angle (degrees) and angular speed (degrees per tick).
+    pub orbit_a: f64,
+    pub orbit_ang: f64,
+    pub orbit_w: f64,
+    /// Ordered to hover in space: stays put instead of joining a nearby sun.
+    pub hold: bool,
+    /// Defending sun `guard - 1` (self-defence); 0 = not a defender.
+    pub guard: u32,
     pub speed_mul: f64,
-    pub cooldown: u16,
-    /// Last wormhole (object index) this ship entered, as `index + 1`; 0 = none. A ship never re-enters the
-    /// wormhole it last went through, which breaks endless loops when a wormhole sits on the line to a target.
-    pub last_wormhole: u32,
+    /// Wobble phase (degrees).
+    pub wobble: f64,
     pub alive: bool,
     /// Inside a neutral zone this tick.
     pub neutral: bool,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct Repeat {
-    pub target: Target,
-    pub then: Option<Target>,
+impl Ship {
+    pub fn idle(&self) -> bool {
+        self.target == Target::None
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum FragilePhase {
     Intact,
-    /// Destroyed; ships pass through.
-    Gone { until: u64 },
+    /// Broken: a small wreck that cannot be captured.
+    Broken { until: u64 },
     /// Growing back; becomes an empty neutral sun at `until`.
     Rebuilding { from: u64, until: u64 },
 }
@@ -64,7 +96,7 @@ pub enum FragilePhase {
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Fragile {
     pub phase: FragilePhase,
-    pub gone_ticks: u32,
+    pub broken_ticks: u32,
     pub rebuild_ticks: u32,
 }
 
@@ -75,78 +107,57 @@ pub struct Sun {
     pub orbit: Option<OrbitDef>,
     /// -1 neutral, else faction index.
     pub faction: i8,
+    /// 0 = empty (only neutral suns are empty), 1..=max_level while owned.
     pub level: u8,
     pub max_level: u8,
-    /// Progress towards the next level (>= 0 while owned).
-    pub progress: i32,
-    /// Ships stationed here.
-    pub stock: u32,
-    /// Faction currently capturing this neutral sun (-1 none) and how far along.
+    pub health: i32,
+    /// Growth towards the next level (owned suns).
+    pub growth: i32,
+    /// Faction currently filling this empty sun (-1 none) and how far along.
     pub cap_faction: i8,
     pub cap_progress: i32,
-    pub accum: i32,
-    pub repeat: Option<Repeat>,
+    ring_timer: u32,
+    accum: u32,
+    rings: u32,
+    /// Tick of the last production ring (for the pulse).
+    pub last_ring: u64,
     pub fragile: Option<Fragile>,
     pub radius: f64,
 }
 
 impl Sun {
-    /// Exists in the world right now (not a destroyed / rebuilding fragile sun).
+    /// Exists in the world right now (not a broken / rebuilding fragile sun).
     pub fn present(&self) -> bool {
         match &self.fragile {
             None => true,
             Some(f) => matches!(f.phase, FragilePhase::Intact),
         }
     }
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub struct Wormhole {
-    pub pos: Vec2,
-    pub centre: Vec2,
-    pub orbit: Option<OrbitDef>,
-    pub size: f64,
-    pub dest: i32,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub struct Supernova {
-    pub def: SupernovaDef,
-    pub pos: Vec2,
-    pub invest: [u32; 4],
-    pub dormant_until: u64,
-    pub last_blast: Option<u64>,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub struct WhiteHole {
-    pub def: WhiteHoleDef,
-    pub pos: Vec2,
-    pub invest: [u32; 4],
-    pub dormant_until: u64,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub struct Gamma {
-    pub def: GammaRayDef,
-    pub pos: Vec2,
-    /// Current beam direction in degrees.
-    pub angle: f64,
-    phase: f64,
-    offset: f64,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub struct Shock {
-    pub def: ShockwaveDef,
-    pub pos: Vec2,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub struct Terrain {
-    pub def: TerrainDef,
-    pub enabled: bool,
-    pub accel: Vec2,
+    pub fn max_health(&self) -> i32 {
+        MAX_HEALTH[self.level.min(5) as usize]
+    }
+    /// Ships of growth for the next level (0 at maximum).
+    pub fn growth_needed(&self) -> i32 {
+        if self.faction < 0 {
+            CAPTURE_COST
+        } else if self.level >= self.max_level {
+            0
+        } else {
+            UPGRADE_COST[self.level as usize]
+        }
+    }
+    /// Would a friendly ship arriving now be used up (repair or growth)?
+    pub fn wants_ships(&self) -> bool {
+        self.faction >= 0 && (self.health < self.max_health() || self.level < self.max_level)
+    }
+    /// Extent of the circling cloud.
+    pub fn cloud_radius(&self) -> f64 {
+        cloud_radius(self.radius, self.level)
+    }
+    /// Orbits along a path (does not self-defend).
+    pub fn moving(&self) -> bool {
+        self.orbit.is_some()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -171,18 +182,24 @@ pub enum Status {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Event {
-    Launch { faction: u8, count: u32 },
+    Order { faction: u8, count: u32 },
     Combat { pos: Vec2, a: u8, b: u8 },
+    /// A production ring left the sun.
+    Ring { sun: usize, ships: u32 },
     SunHit { sun: usize },
     SunUpgraded { sun: usize, level: u8 },
     SunMaxed { sun: usize },
     SunCaptured { sun: usize, faction: u8 },
-    SunLost { sun: usize, faction: u8 },
-    SunDestroyed { sun: usize },
+    /// Health reached zero (or a gamma ray / supernova): the sun dropped to empty. `level` before death.
+    SunDied { sun: usize, faction: i8, level: u8 },
+    SunBroken { sun: usize },
     SunRebuilt { sun: usize },
     WormholeJump { obj: usize },
+    SupernovaCollapse { obj: usize, faction: u8 },
     Supernova { obj: usize, faction: u8 },
     WhiteHole { obj: usize, faction: u8, ships: u32 },
+    GammaWarning { obj: usize },
+    GammaPulse { obj: usize },
     Eliminated { faction: u8 },
     OrderRejected { faction: u8, why: OrderError },
 }
@@ -191,38 +208,23 @@ pub enum Event {
 pub enum OrderError {
     UnknownFaction,
     Eliminated,
-    NoSources,
-    TooManySources,
-    NotYourSun,
     BadTarget,
-    BadPercent,
-    TooManyOrders,
-    TooManyRepeats,
+    /// The target lies in fogged space.
+    Fogged,
     NoShips,
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Command {
-    Order {
-        faction: u8,
-        sources: Vec<usize>,
-        target: Target,
-        /// Optional follow-up after a wormhole target.
-        then: Option<Target>,
-        /// Fraction of each source's stationed ships to send (1..=100).
-        percent: u8,
-        /// Keep sending newly produced ships to the same target.
-        repeat: bool,
-    },
-    /// Cancel standing (repeat) orders at these suns.
-    Cancel { faction: u8, sources: Vec<usize> },
+    /// Send these ships (by id; ids that are not the faction's live ships are ignored) to `target`.
+    Order { faction: u8, ships: Vec<u32>, target: Target },
     Surrender { faction: u8 },
 }
 
 #[derive(Debug, Clone)]
 pub struct SimConfig {
     pub seed: u64,
-    /// AI difficulty 0 (easy) .. 3 (insane).
+    /// AI difficulty 0 (easy) .. 3 (hardest).
     pub ai_difficulty: u8,
     /// Let the AI also drive faction 0 (used by tests and demos).
     pub human_ai: bool,
@@ -239,35 +241,48 @@ impl Default for SimConfig {
 #[derive(Debug, Clone)]
 pub struct FactionState {
     pub alive: bool,
-    pub max_sources: u32,
-    pub max_orders: u32,
     pub think_period: u32,
-    order_log: Vec<u64>,
+    /// Strength lost in ship-to-ship combat so far.
+    pub combat_losses: u32,
     pub(crate) next_think: u64,
+    pub(crate) plans: u32,
 }
 
-#[derive(Debug, Clone, Copy)]
-pub(crate) enum Pending {
-    Invest { obj: usize, faction: u8, n: u32 },
+/// One sample of per-faction statistics (for the results screen).
+#[derive(Debug, Clone, PartialEq)]
+pub struct Sample {
+    pub tick: u64,
+    /// Total ship strength.
+    pub ships: Vec<u32>,
+    /// Ships produced per second (by the current suns).
+    pub production: Vec<u32>,
+    /// Cumulative combat losses.
+    pub losses: Vec<u32>,
+    pub suns: Vec<u32>,
 }
 
 pub struct Sim {
     pub tick: u64,
     pub objs: Vec<Obj>,
+    /// Every ship, sorted by `id`.
     pub ships: Vec<Ship>,
     pub factions: Vec<FactionState>,
     pub status: Status,
     pub fog: Option<FogDef>,
     pub cfg: SimConfig,
+    pub stats: Vec<Sample>,
     pub(crate) rng: Rng,
     next_ship_id: u32,
-    events: Vec<Event>,
-    terrain_idx: Vec<usize>,
-    wormholes: Vec<usize>,
+    pub(crate) events: Vec<Event>,
+    pub(crate) terrain_idx: Vec<usize>,
+    pub(crate) wormholes: Vec<usize>,
+    /// (sun, faction) whose capture / upgrade completed this tick: more arrivals join the cloud instead.
+    pub(crate) completed: Vec<(usize, u8)>,
+    pub(crate) strength_cache: Vec<u32>,
 }
 
 // ------------------------------------------------------------------------------------------------ helpers
-fn v2(p: [f64; 2]) -> Vec2 {
+pub(crate) fn v2(p: [f64; 2]) -> Vec2 {
     Vec2::new(p[0], p[1])
 }
 
@@ -279,52 +294,23 @@ pub fn orbit_pos(centre: Vec2, o: &OrbitDef, tick: u64) -> Vec2 {
     centre + Vec2::new(o.rx * cos_deg(ang), o.ry * sin_deg(ang)).rotate(o.rotation_deg)
 }
 
-fn has_orbit(o: &OrbitDef) -> bool {
+pub(crate) fn has_orbit(o: &OrbitDef) -> bool {
     o.rx != 0.0 || o.ry != 0.0
 }
 
+/// Ships per second a sun at `level` produces (ring size; one ring per second).
 pub fn production_per_sec(level: u8) -> f64 {
-    PRODUCTION_TENTHS[(level as usize).min(5)] as f64 / 10.0
+    RING_SHIPS[(level as usize).min(5)] as f64 * TICKS_PER_SEC as f64 / RING_TICKS as f64
 }
 
-#[derive(Default)]
-struct TerrainFx {
-    speed: f64,
-    accel: Vec2,
-    mine_ppm: u32,
-    confuse_faction_ppm: u32,
-    confuse_order_ppm: u32,
-    neutral: bool,
-}
-
-fn rate_ppm(percent_per_sec: f64) -> u32 {
-    // percent per second -> parts per million per tick
-    (percent_per_sec * 10000.0 / TICKS_PER_SEC as f64).clamp(0.0, 1_000_000.0) as u32
-}
-
-impl Terrain {
-    pub fn contains(&self, p: Vec2) -> bool {
-        if !self.enabled {
-            return false;
-        }
-        let d = &self.def;
-        let c = v2(d.pos);
-        if d.outer_radius > 0.0 {
-            let r = p.dist(c);
-            return r >= d.inner_radius && r <= d.outer_radius;
-        }
-        let cx = ((p.x - c.x) / d.tile_size).floor();
-        let cy = ((p.y - c.y) / d.tile_size).floor();
-        if cx < 0.0 || cy < 0.0 || cx >= d.cols as f64 || cy >= d.rows as f64 {
-            return false;
-        }
-        d.data.get(cy as usize * d.cols as usize + cx as usize).copied().unwrap_or(0) != 0
-    }
+/// Point on a sun's orbit oval (semi-major `a`, parameter angle `ang`).
+pub fn oval(centre: Vec2, a: f64, ang: f64) -> Vec2 {
+    centre + Vec2::new(a * cos_deg(ang), a * ORBIT_FLATTEN * sin_deg(ang))
 }
 
 /// What a faction can see (fog of war). With no fog everything is visible.
 pub struct Vision {
-    /// No fog on this level: everything is visible.
+    /// No fog on this level (or fog lifted): everything is visible.
     pub all: bool,
     /// Visible discs (centre, radius).
     pub circles: Vec<(Vec2, f64)>,
@@ -338,35 +324,58 @@ impl Vision {
 // ------------------------------------------------------------------------------------------------ construction
 impl Sim {
     pub fn new(map: &Map, cfg: SimConfig) -> Sim {
-        let mut rng = Rng::new(cfg.seed);
-        let mut objs = Vec::new();
-        let mut fog = None;
-        let mut terrain_idx = Vec::new();
-        let mut wormholes = Vec::new();
+        let rng = Rng::new(cfg.seed);
+        let factions = map
+            .factions
+            .iter()
+            .map(|f| FactionState { alive: true, think_period: f.think_period, combat_losses: 0, next_think: 0, plans: 0 })
+            .collect();
+        let mut sim = Sim {
+            tick: 0,
+            objs: Vec::new(),
+            ships: Vec::new(),
+            factions,
+            status: Status::Playing,
+            fog: None,
+            cfg,
+            stats: Vec::new(),
+            rng,
+            next_ship_id: 0,
+            events: Vec::new(),
+            terrain_idx: Vec::new(),
+            wormholes: Vec::new(),
+            completed: Vec::new(),
+            strength_cache: Vec::new(),
+        };
+        let nf = sim.factions.len() as i32;
+        let mut garrisons = Vec::new();
         for (i, o) in map.objects.iter().enumerate() {
             let make_sun = |s: &au2_map::SunDef, orbit: Option<OrbitDef>, fragile: Option<Fragile>| {
                 let max_level = s.max_power.clamp(1, 5) as u8;
-                let owned = s.faction >= 0;
+                let owned = s.faction >= 0 && s.faction < nf;
                 let centre = v2(s.pos);
                 let pos = match &orbit {
                     Some(or) => orbit_pos(centre, or, 0),
                     None => centre,
                 };
+                let level = if owned { (s.power.max(1) as u8).min(max_level) } else { 0 };
                 Sun {
                     pos,
                     centre,
                     orbit,
-                    faction: s.faction as i8,
-                    level: if owned { (s.power.max(0) as u8).min(max_level) } else { 0 },
+                    faction: if owned { s.faction as i8 } else { -1 },
+                    level,
                     max_level,
-                    progress: 0,
-                    stock: if owned { s.starting_units } else { 0 },
+                    health: MAX_HEALTH[level as usize],
+                    growth: 0,
                     cap_faction: -1,
                     cap_progress: 0,
+                    ring_timer: 0,
                     accum: 0,
-                    repeat: None,
+                    rings: 0,
+                    last_ring: 0,
                     fragile,
-                    radius: sun_radius(max_level),
+                    radius: sun_radius(level),
                 }
             };
             let obj = match o {
@@ -377,66 +386,54 @@ impl Sim {
                     has_orbit(&f.orbit).then(|| f.orbit.clone()),
                     Some(Fragile {
                         phase: FragilePhase::Intact,
-                        gone_ticks: f.broken_seconds * FRAGILE_TICKS_PER_UNIT,
+                        broken_ticks: f.broken_seconds * FRAGILE_TICKS_PER_UNIT,
                         rebuild_ticks: f.rebuild_frames.max(1),
                     }),
                 )),
                 Object::Wormhole(w) => {
-                    wormholes.push(i);
-                    let centre = v2(w.pos);
-                    let orbit = has_orbit(&w.orbit).then(|| w.orbit.clone());
-                    let pos = orbit.as_ref().map(|or| orbit_pos(centre, or, 0)).unwrap_or(centre);
-                    Obj::Wormhole(Wormhole { pos, centre, orbit, size: w.size, dest: w.destination })
+                    sim.wormholes.push(i);
+                    Obj::Wormhole(Wormhole::new(w))
                 }
-                Object::Supernova(d) => Obj::Supernova(Supernova { def: d.clone(), pos: v2(d.pos), invest: [0; 4], dormant_until: 0, last_blast: None }),
-                Object::WhiteHole(d) => Obj::WhiteHole(WhiteHole { def: d.clone(), pos: v2(d.pos), invest: [0; 4], dormant_until: 0 }),
-                Object::GammaRay(d) => {
-                    let off = if d.random_start { rng.unit() * 360.0 } else { 0.0 };
-                    Obj::Gamma(Gamma { def: d.clone(), pos: v2(d.pos), angle: d.rotation_deg + off, phase: 0.0, offset: off })
-                }
+                Object::Supernova(d) => Obj::Supernova(Supernova::new(d)),
+                Object::WhiteHole(d) => Obj::WhiteHole(WhiteHole::new(d)),
+                Object::GammaRay(d) => Obj::Gamma(Gamma::new(d, &mut sim.rng)),
                 Object::Shockwave(d) => Obj::Shock(Shock { def: d.clone(), pos: v2(d.pos) }),
                 Object::Fog(d) => {
-                    fog = Some(d.clone());
+                    sim.fog = Some(d.clone());
                     Obj::Fog
                 }
                 Object::Terrain(d) => {
-                    terrain_idx.push(i);
-                    Obj::Terrain(Terrain { def: d.clone(), enabled: d.enabled, accel: v2(d.acceleration) })
+                    sim.terrain_idx.push(i);
+                    Obj::Terrain(Terrain::new(d))
                 }
                 Object::Unknown(_) => Obj::Other,
             };
-            objs.push(obj);
+            if let (Obj::Sun(s), Some(n)) = (&obj, sun_garrison(o)) {
+                if s.faction >= 0 && n > 0 {
+                    garrisons.push((i, n));
+                }
+            }
+            sim.objs.push(obj);
         }
-        let factions = map
-            .factions
-            .iter()
-            .map(|f| FactionState {
-                alive: true,
-                max_sources: f.max_sources.max(1),
-                max_orders: f.max_orders.max(1),
-                think_period: f.think_period,
-                order_log: Vec::new(),
-                next_think: 0,
-            })
-            .collect();
-        let mut sim = Sim {
-            tick: 0,
-            objs,
-            ships: Vec::new(),
-            factions,
-            status: Status::Playing,
-            fog,
-            cfg,
-            rng,
-            next_ship_id: 0,
-            events: Vec::new(),
-            terrain_idx,
-            wormholes,
-        };
-        // stagger AI start deterministically
+        // starting garrisons are laid out on their sun's orbits
+        for (j, n) in garrisons {
+            for _ in 0..n {
+                let (pos, f) = {
+                    let s = sim.sun(j).unwrap();
+                    (s.pos, s.faction as u8)
+                };
+                let mut sh = sim.new_ship(f, pos, Target::None);
+                sim.join_orbit(&mut sh, j, None);
+                let s = sim.sun(j).unwrap();
+                sh.pos = oval(s.pos, sh.orbit_a, sh.orbit_ang);
+                sim.spawn(sh);
+            }
+        }
+        // the AI waits a few seconds before its first plan (staggered per faction)
         for f in 0..sim.factions.len() {
-            sim.factions[f].next_think = 10 + 7 * f as u64;
+            sim.factions[f].next_think = AI_START_TICKS + 23 * f as u64;
         }
+        sim.sample_stats();
         sim
     }
 
@@ -451,7 +448,7 @@ impl Sim {
             _ => None,
         }
     }
-    fn sun_mut(&mut self, i: usize) -> Option<&mut Sun> {
+    pub(crate) fn sun_mut(&mut self, i: usize) -> Option<&mut Sun> {
         match self.objs.get_mut(i) {
             Some(Obj::Sun(s)) => Some(s),
             _ => None,
@@ -495,15 +492,15 @@ impl Sim {
         }
     }
 
-    /// Order-target under a world point (for mouse picking): suns, wormholes, holes, supernovas.
+    /// Order-target under a world point (for picking): suns, wormholes, white holes, supernovas.
     pub fn pick(&self, p: Vec2, slack: f64) -> Option<usize> {
         let mut best: Option<(f64, usize)> = None;
         for (i, o) in self.objs.iter().enumerate() {
             let (pos, r) = match o {
                 Obj::Sun(s) if s.present() => (s.pos, s.radius),
                 Obj::Wormhole(w) => (w.pos, w.size),
-                Obj::WhiteHole(w) => (w.pos, w.def.game_size.max(150.0)),
-                Obj::Supernova(s) => (s.pos, s.def.start_scale.max(150.0)),
+                Obj::WhiteHole(w) => (w.pos, w.radius()),
+                Obj::Supernova(s) => (s.pos, s.radius()),
                 _ => continue,
             };
             let d = pos.dist(p);
@@ -514,31 +511,67 @@ impl Sim {
         best.map(|(_, i)| i)
     }
 
-    pub fn ship_count(&self, faction: u8) -> usize {
-        self.ships.iter().filter(|s| s.faction == faction).count()
+    /// Radius of the area selected by tapping sun `i` (its whole circling cloud).
+    pub fn sun_select_radius(&self, i: usize) -> f64 {
+        self.sun(i).map(|s| s.cloud_radius() + 60.0).unwrap_or(0.0)
     }
-    pub fn stock_total(&self, faction: u8) -> u32 {
-        self.suns().filter(|(_, s)| s.faction == faction as i8).map(|(_, s)| s.stock).sum()
+
+    /// Ids of `faction`'s live ships inside the circle (orbiting, hovering and flying alike).
+    pub fn ships_in_circle(&self, faction: u8, c: Vec2, r: f64) -> Vec<u32> {
+        let r2 = r * r;
+        self.ships.iter().filter(|s| s.alive && s.faction == faction && s.pos.dist2(c) <= r2).map(|s| s.id).collect()
+    }
+
+    /// Ids of all of `faction`'s live ships.
+    pub fn all_ships(&self, faction: u8) -> Vec<u32> {
+        self.ships.iter().filter(|s| s.alive && s.faction == faction).map(|s| s.id).collect()
+    }
+
+    /// Index into `ships` of the ship with this id.
+    pub fn ship_index(&self, id: u32) -> Option<usize> {
+        self.ships.binary_search_by_key(&id, |s| s.id).ok()
+    }
+
+    /// Number of ship dots of a faction.
+    pub fn ship_count(&self, faction: u8) -> usize {
+        self.ships.iter().filter(|s| s.alive && s.faction == faction).count()
+    }
+    /// Total strength (ships, counting fused ships as what they were made of) of a faction.
+    pub fn strength(&self, faction: u8) -> u32 {
+        self.ships.iter().filter(|s| s.alive && s.faction == faction).map(|s| s.strength).sum()
     }
     pub fn sun_count(&self, faction: u8) -> usize {
-        self.suns().filter(|(_, s)| s.faction == faction as i8).count()
+        self.suns().filter(|(_, s)| s.faction == faction as i8 && s.present()).count()
+    }
+    /// Ships per second the faction's suns make right now (before any AI handicap).
+    pub fn production(&self, faction: u8) -> u32 {
+        self.suns().filter(|(_, s)| s.faction == faction as i8 && s.present()).map(|(_, s)| production_per_sec(s.level) as u32).sum()
+    }
+    /// Strength of `faction`'s idle ships circling sun `j`.
+    pub fn orbiting_strength(&self, faction: u8, j: usize) -> u32 {
+        self.ships
+            .iter()
+            .filter(|s| s.alive && s.faction == faction && s.mode == Mode::Orbit && s.home == j as u32 && s.idle())
+            .map(|s| s.strength)
+            .sum()
     }
 
     pub fn vision(&self, faction: u8) -> Vision {
         let Some(f) = &self.fog else { return Vision { all: true, circles: Vec::new() } };
+        if !self.factions[0].alive || self.status != Status::Playing {
+            return Vision { all: true, circles: Vec::new() };
+        }
         let mut circles = Vec::new();
         for (_, s) in self.suns() {
-            if s.faction == faction as i8 && s.present() {
-                circles.push((s.pos, f.sun_radius + f.additional_per_ring * s.level.saturating_sub(1) as f64));
-            } else if s.faction < 0 && f.unowned_radius > 0.0 && s.present() {
-                circles.push((s.pos, f.unowned_radius));
-            } else if s.faction >= 0 && s.faction != faction as i8 && f.enemy_radius > 0.0 && s.present() {
-                circles.push((s.pos, f.enemy_radius));
+            if !s.present() {
+                continue;
             }
-        }
-        for sh in &self.ships {
-            if sh.faction == faction {
-                circles.push((sh.pos, f.non_sun_radius));
+            if s.faction == faction as i8 {
+                circles.push((s.pos, f.sun_radius + f.additional_per_ring * s.level.saturating_sub(1) as f64));
+            } else if s.faction < 0 {
+                circles.push((s.pos, if f.unowned_radius > 0.0 { f.unowned_radius } else { s.radius * 2.5 }));
+            } else {
+                circles.push((s.pos, if f.enemy_radius > 0.0 { f.enemy_radius } else { s.radius * 2.5 }));
             }
         }
         Vision { all: false, circles }
@@ -564,20 +597,22 @@ impl Sim {
             mix(s.pos.x.to_bits());
             mix(s.pos.y.to_bits());
             mix(s.faction as u64);
+            mix(s.strength as u64);
         }
         for o in &self.objs {
             match o {
                 Obj::Sun(s) => {
                     mix(s.faction as i64 as u64);
                     mix(s.level as u64);
-                    mix(s.progress as i64 as u64);
-                    mix(s.stock as u64);
+                    mix(s.health as i64 as u64);
+                    mix(s.growth as i64 as u64);
                     mix(s.cap_progress as i64 as u64);
                     mix(s.pos.x.to_bits());
                 }
-                Obj::Supernova(s) => s.invest.iter().for_each(|v| mix(*v as u64)),
-                Obj::WhiteHole(s) => s.invest.iter().for_each(|v| mix(*v as u64)),
-                Obj::Gamma(g) => mix(g.angle.to_bits()),
+                Obj::Supernova(s) => mix(s.invest as u64 ^ ((s.investor as i64 as u64) << 32)),
+                Obj::WhiteHole(s) => mix(s.invest as u64 ^ ((s.investor as i64 as u64) << 32)),
+                Obj::Gamma(g) => mix(g.next_pulse),
+                Obj::Terrain(t) => t.mines.iter().for_each(|m| mix(*m as u64)),
                 _ => {}
             }
         }
@@ -599,139 +634,135 @@ impl Sim {
                 self.surrender(faction);
                 Ok(())
             }
-            Command::Cancel { faction, sources } => {
-                self.check_faction(faction)?;
-                for s in sources {
-                    if let Some(su) = self.sun_mut(s) {
-                        if su.faction == faction as i8 {
-                            su.repeat = None;
-                        }
-                    }
-                }
-                Ok(())
-            }
-            Command::Order { faction, sources, target, then, percent, repeat } => {
-                self.order(faction, sources, target, then, percent, repeat)
-            }
+            Command::Order { faction, ships, target } => self.order(faction, &ships, target),
         }
     }
 
-    fn check_faction(&self, faction: u8) -> Result<(), OrderError> {
+    fn order(&mut self, faction: u8, ids: &[u32], target: Target) -> Result<(), OrderError> {
         match self.factions.get(faction as usize) {
-            None => Err(OrderError::UnknownFaction),
-            Some(f) if !f.alive => Err(OrderError::Eliminated),
-            Some(_) => Ok(()),
+            None => return Err(OrderError::UnknownFaction),
+            Some(f) if !f.alive => return Err(OrderError::Eliminated),
+            Some(_) => {}
         }
-    }
-
-    fn order(&mut self, faction: u8, sources: Vec<usize>, target: Target, then: Option<Target>, percent: u8, repeat: bool) -> Result<(), OrderError> {
-        self.check_faction(faction)?;
-        if sources.is_empty() {
-            return Err(OrderError::NoSources);
-        }
-        let mut srcs = sources;
-        srcs.sort_unstable();
-        srcs.dedup();
-        if srcs.len() > self.factions[faction as usize].max_sources as usize {
-            return Err(OrderError::TooManySources);
-        }
-        if !(1..=100).contains(&percent) {
-            return Err(OrderError::BadPercent);
-        }
-        for &s in &srcs {
-            match self.sun(s) {
-                Some(su) if su.faction == faction as i8 && su.present() => {}
-                _ => return Err(OrderError::NotYourSun),
-            }
-        }
-        if !self.valid_target(target) || then.map(|t| !self.valid_target(t)).unwrap_or(false) {
+        if !self.valid_target(target) {
             return Err(OrderError::BadTarget);
         }
-        // rate cap: at most `maxorders` orders per rolling second
-        let tick = self.tick;
-        let max_orders = self.factions[faction as usize].max_orders as usize;
-        {
-            let log = &mut self.factions[faction as usize].order_log;
-            log.retain(|&t| t + ORDER_WINDOW_TICKS > tick);
-            if log.len() >= max_orders {
-                return Err(OrderError::TooManyOrders);
-            }
+        let tp = self.target_pos(target).unwrap();
+        if self.fog.is_some() && !self.vision(faction).visible(tp) {
+            return Err(OrderError::Fogged);
         }
-        if repeat {
-            let standing = self.suns().filter(|(i, s)| s.faction == faction as i8 && s.repeat.is_some() && !srcs.contains(i)).count();
-            if standing + srcs.len() > max_orders {
-                return Err(OrderError::TooManyRepeats);
-            }
-        }
-        let any_stock = srcs.iter().any(|&s| self.sun(s).map(|x| x.stock > 0).unwrap_or(false));
-        if !any_stock && !repeat {
+        let idx: Vec<usize> = ids.iter().filter_map(|&id| self.ship_index(id)).filter(|&i| self.ships[i].alive && self.ships[i].faction == faction).collect();
+        if idx.is_empty() {
             return Err(OrderError::NoShips);
         }
-        self.factions[faction as usize].order_log.push(tick);
-        let mut total = 0;
-        for &s in &srcs {
-            let stock = self.sun(s).unwrap().stock;
-            let n = ((stock as u64 * percent as u64 + 99) / 100) as u32;
-            let n = n.min(stock);
-            if n > 0 {
-                self.sun_mut(s).unwrap().stock -= n;
-                self.launch(s, n, target, then);
-                total += n;
-            }
-            self.sun_mut(s).unwrap().repeat = if repeat { Some(Repeat { target, then }) } else { None };
+        // ships sent to empty space spread over a disc so the swarm hovers as a loose cloud
+        let spread = if let Target::Point(_) = target { (POINT_SPREAD * (idx.len() as f64).sqrt()).min(POINT_SPREAD_MAX) } else { 0.0 };
+        let mut count = 0;
+        for i in idx {
+            let t = match target {
+                Target::Point(p) => {
+                    let off = dir_deg(self.rng.unit() * 360.0) * (spread * self.rng.unit().sqrt());
+                    Target::Point(p + off)
+                }
+                t => t,
+            };
+            let s = &mut self.ships[i];
+            s.target = t;
+            s.mode = Mode::Fly;
+            s.home = NO_SUN;
+            s.hold = matches!(target, Target::Point(_));
+            s.guard = 0;
+            count += s.strength;
         }
-        if total > 0 {
-            self.events.push(Event::Launch { faction, count: total });
-        }
+        self.events.push(Event::Order { faction, count });
         Ok(())
     }
 
     fn surrender(&mut self, faction: u8) {
-        for i in 0..self.objs.len() {
-            let owned = matches!(&self.objs[i], Obj::Sun(s) if s.faction == faction as i8);
-            if owned {
-                self.neutralize(i, false);
+        for j in 0..self.objs.len() {
+            if matches!(&self.objs[j], Obj::Sun(s) if s.faction == faction as i8) {
+                self.kill_sun(j);
             }
         }
-        self.ships.retain(|s| s.faction != faction);
+        for s in self.ships.iter_mut() {
+            if s.faction == faction {
+                s.alive = false;
+            }
+        }
+        self.ships.retain(|s| s.alive);
         self.update_status();
     }
 
-    /// Spawn `n` ships of the sun's owner at the sun, heading for `target`.
-    fn launch(&mut self, sun: usize, n: u32, target: Target, then: Option<Target>) {
-        let (centre, radius, faction) = {
-            let s = self.sun(sun).unwrap();
-            (s.pos, s.radius, s.faction as u8)
-        };
-        let tp = self.target_pos(target).unwrap_or(centre);
-        let base = (tp - centre).norm_or(Vec2::new(1.0, 0.0));
-        for _ in 0..n {
-            let ang = self.rng.unit() * 360.0;
-            let r = radius * 0.8 * self.rng.unit().sqrt();
-            let pos = centre + dir_deg(ang) * r;
-            let heading = base.rotate(self.rng.signed_unit() * LAUNCH_SPREAD_DEG);
-            let speed_mul = 1.0 + self.rng.signed_unit() * SPEED_JITTER;
-            self.spawn(Ship {
-                id: 0,
-                pos,
-                heading,
-                push: Vec2::ZERO,
-                faction,
-                target,
-                then,
-                speed_mul,
-                cooldown: 0,
-                last_wormhole: 0,
-                alive: true,
-                neutral: false,
-            });
+    // -------------------------------------------------------------------------------------------- ships
+    pub(crate) fn new_ship(&mut self, faction: u8, pos: Vec2, target: Target) -> Ship {
+        let speed_mul = 1.0 + self.rng.signed_unit() * SPEED_JITTER;
+        let wobble = self.rng.unit() * 360.0;
+        Ship {
+            id: 0,
+            pos,
+            heading: Vec2::new(1.0, 0.0),
+            push: Vec2::ZERO,
+            faction,
+            strength: 1,
+            target,
+            mode: if target == Target::None { Mode::Hover } else { Mode::Fly },
+            home: NO_SUN,
+            orbit_a: 0.0,
+            orbit_ang: 0.0,
+            orbit_w: 0.0,
+            hold: false,
+            guard: 0,
+            speed_mul,
+            wobble,
+            alive: true,
+            neutral: false,
         }
     }
 
-    fn spawn(&mut self, mut s: Ship) {
+    /// Add a ship (scenario setup, tests, tools) and return its id. With `Target::None` it is idle: it joins a nearby
+    /// friendly sun's cloud or hovers. With `Target::Point(p)` at its own position it hovers there, held.
+    pub fn add_ship(&mut self, faction: u8, pos: Vec2, target: Target) -> u32 {
+        let mut s = self.new_ship(faction, pos, target);
+        if let Some(tp) = self.target_pos(target) {
+            s.heading = (tp - pos).norm_or(s.heading);
+        }
+        if let Target::Point(_) = target {
+            s.hold = true;
+        }
+        if target == Target::None {
+            self.make_idle(&mut s);
+        }
+        let id = self.next_ship_id;
+        self.spawn(s);
+        id
+    }
+
+    pub(crate) fn spawn(&mut self, mut s: Ship) {
         s.id = self.next_ship_id;
         self.next_ship_id = self.next_ship_id.wrapping_add(1);
         self.ships.push(s);
+    }
+
+    /// Put `s` on an orbit around sun `j`. `at`: start at this parameter angle (else from the ship's position).
+    pub(crate) fn join_orbit(&mut self, s: &mut Ship, j: usize, at: Option<f64>) {
+        let Some(sun) = self.sun(j) else { return };
+        let (pos, r, level) = (sun.pos, sun.radius, sun.level);
+        let band = self.rng.below(orbit_bands(level)) as f64;
+        let a = r * (ORBIT_MIN + (band + self.rng.unit()) * ORBIT_BAND_STEP);
+        let v = ORBIT_SPEED * (1.0 + self.rng.signed_unit() * ORBIT_SPEED_JITTER);
+        let rel = s.pos - pos;
+        s.orbit_ang = match at {
+            Some(a) => a,
+            None if rel.len2() > 1.0 => math::atan2_deg(rel.y / ORBIT_FLATTEN, rel.x),
+            None => self.rng.unit() * 360.0,
+        };
+        s.orbit_a = a;
+        s.orbit_w = v / a * (180.0 / std::f64::consts::PI);
+        s.mode = Mode::Orbit;
+        s.home = j as u32;
+        s.target = Target::None;
+        s.hold = false;
+        s.guard = 0;
     }
 
     /// Nearest present sun owned by `faction` to `p`.
@@ -748,162 +779,156 @@ impl Sim {
         best.map(|(_, i)| i)
     }
 
-    // -------------------------------------------------------------------------------------------- sun state changes
-    fn level_up_check(&mut self, j: usize) {
-        let mut ev = None;
-        {
-            let Some(s) = self.sun_mut(j) else { return };
-            if s.level < s.max_level && s.progress >= UPGRADE_COST[s.level as usize] {
-                s.level += 1;
-                s.progress = 0;
-                ev = Some((s.level, s.level == s.max_level));
+    /// The friendly sun an idle ship at `p` would join (nearest, rim within [`JOIN_DISTANCE`]).
+    pub fn join_candidate(&self, faction: u8, p: Vec2) -> Option<usize> {
+        let mut best: Option<(f64, usize)> = None;
+        for (i, s) in self.suns() {
+            if s.faction == faction as i8 && s.present() {
+                let d = s.pos.dist(p) - s.radius;
+                if d <= JOIN_DISTANCE && best.map(|(bd, _)| d < bd).unwrap_or(true) {
+                    best = Some((d, i));
+                }
             }
         }
-        if let Some((lvl, maxed)) = ev {
-            self.events.push(Event::SunUpgraded { sun: j, level: lvl });
-            if maxed {
-                self.events.push(Event::SunMaxed { sun: j });
-            }
-        }
+        best.map(|(_, i)| i)
     }
 
-    /// Owner loses the sun: it becomes neutral (or is destroyed if fragile and `destroy_fragile`).
-    fn neutralize(&mut self, j: usize, destroy_fragile: bool) {
+    // -------------------------------------------------------------------------------------------- sun state changes
+    /// The sun dies: it drops to an empty, ownerless sun whatever its level (fragile suns break).
+    pub(crate) fn kill_sun(&mut self, j: usize) {
         let tick = self.tick;
-        let mut lost = None;
-        let mut destroyed = false;
-        {
+        let (faction, level, broke) = {
             let Some(s) = self.sun_mut(j) else { return };
             if !s.present() {
                 return;
             }
-            if s.faction >= 0 {
-                lost = Some(s.faction as u8);
-            }
+            let (f, l) = (s.faction, s.level);
             s.faction = -1;
             s.level = 0;
-            s.progress = 0;
-            s.stock = 0;
+            s.health = MAX_HEALTH[0];
+            s.growth = 0;
             s.cap_faction = -1;
             s.cap_progress = 0;
+            s.ring_timer = 0;
             s.accum = 0;
-            s.repeat = None;
-            if destroy_fragile {
-                if let Some(f) = &mut s.fragile {
-                    f.phase = FragilePhase::Gone { until: tick + f.gone_ticks as u64 };
-                    destroyed = true;
-                }
+            s.radius = sun_radius(0);
+            let mut broke = false;
+            if let Some(fr) = &mut s.fragile {
+                fr.phase = FragilePhase::Broken { until: tick + fr.broken_ticks as u64 };
+                broke = true;
             }
+            (f, l, broke)
+        };
+        if faction >= 0 || broke {
+            self.events.push(Event::SunDied { sun: j, faction, level });
         }
-        if let Some(f) = lost {
-            self.events.push(Event::SunLost { sun: j, faction: f });
-        }
-        if destroyed {
-            self.events.push(Event::SunDestroyed { sun: j });
+        if broke {
+            self.events.push(Event::SunBroken { sun: j });
         }
     }
 
-    /// A ship of `faction` reaches sun `j` and is absorbed.
-    fn arrive_at_sun(&mut self, faction: u8, j: usize) {
+    /// A ship of `faction` with `strength` reaches sun `j`. Returns the strength left over (the ship survives with
+    /// it): growth beyond a completed capture/upgrade, damage beyond a kill, or everything if the sun needs nothing.
+    pub(crate) fn arrive_at_sun(&mut self, faction: u8, strength: u32, j: usize) -> u32 {
         let f = faction as i8;
-        enum Next {
-            Nothing,
-            LevelUp,
-            Neutralize,
-            Captured,
-            Hit,
+        if self.completed.contains(&(j, faction)) {
+            return strength;
         }
-        let next = {
+        let mut left = strength as i32;
+        enum Done {
+            Nothing,
+            Hit,
+            Died,
+            Captured,
+            Upgraded(u8, bool),
+        }
+        let done = {
             let s = self.sun_mut(j).unwrap();
             if s.faction == f {
-                if s.level < s.max_level {
-                    s.progress += 1;
-                    Next::LevelUp
+                let max_h = s.max_health();
+                if s.health < max_h {
+                    let k = left.min(max_h - s.health);
+                    s.health += k;
+                    left -= k;
+                }
+                if left > 0 && s.level < s.max_level {
+                    let need = UPGRADE_COST[s.level as usize] - s.growth;
+                    let k = left.min(need);
+                    s.growth += k;
+                    left -= k;
+                    if s.growth >= UPGRADE_COST[s.level as usize] {
+                        s.level += 1;
+                        s.growth = 0;
+                        s.health = s.max_health();
+                        s.radius = sun_radius(s.level);
+                        Done::Upgraded(s.level, s.level == s.max_level)
+                    } else {
+                        Done::Nothing
+                    }
                 } else {
-                    s.stock += 1; // reserve at maximum level
-                    Next::Nothing
+                    Done::Nothing
                 }
             } else if s.faction >= 0 {
-                let dmg = if s.stock > 0 {
-                    s.stock -= 1;
-                    (HIT_DAMAGE + 1) / 2
+                let k = left.min(s.health);
+                s.health -= k;
+                left -= k;
+                if s.health <= 0 {
+                    Done::Died
                 } else {
-                    HIT_DAMAGE
-                };
-                s.progress -= dmg;
-                if s.progress < 0 {
-                    if s.level > 0 {
-                        s.level -= 1;
-                        s.progress = UPGRADE_COST[s.level as usize] / 2;
-                        Next::Hit
-                    } else {
-                        Next::Neutralize
-                    }
-                } else {
-                    Next::Hit
+                    Done::Hit
                 }
             } else {
-                if s.cap_faction == f || s.cap_progress <= 0 {
+                // empty sun: a tug of war over its growth
+                if s.cap_faction != f && s.cap_progress > 0 {
+                    let k = left.min(s.cap_progress);
+                    s.cap_progress -= k;
+                    left -= k;
+                    if s.cap_progress == 0 {
+                        s.cap_faction = -1;
+                    }
+                }
+                if left > 0 {
                     s.cap_faction = f;
-                    s.cap_progress += 1;
-                } else {
-                    s.cap_progress -= 1;
+                    let k = left.min(CAPTURE_COST - s.cap_progress);
+                    s.cap_progress += k;
+                    left -= k;
                 }
                 if s.cap_progress >= CAPTURE_COST {
-                    if s.fragile.is_some() {
-                        Next::Neutralize // handled below as a destruction
-                    } else {
-                        s.faction = f;
-                        s.level = 0;
-                        s.progress = 0;
-                        s.stock = 0;
-                        s.cap_faction = -1;
-                        s.cap_progress = 0;
-                        s.accum = 0;
-                        Next::Captured
-                    }
+                    s.faction = f;
+                    s.level = 1;
+                    s.health = s.max_health();
+                    s.growth = 0;
+                    s.cap_faction = -1;
+                    s.cap_progress = 0;
+                    s.ring_timer = 0;
+                    s.accum = 0;
+                    s.radius = sun_radius(1);
+                    Done::Captured
                 } else {
-                    Next::Nothing
+                    Done::Nothing
                 }
             }
         };
-        match next {
-            Next::Nothing => {}
-            Next::LevelUp => self.level_up_check(j),
-            Next::Hit => self.events.push(Event::SunHit { sun: j }),
-            Next::Neutralize => self.neutralize(j, true),
-            Next::Captured => self.events.push(Event::SunCaptured { sun: j, faction }),
-        }
-    }
-
-    // -------------------------------------------------------------------------------------------- terrain
-    fn terrain_fx(&self, p: Vec2) -> TerrainFx {
-        let mut fx = TerrainFx { speed: 1.0, ..Default::default() };
-        for &i in &self.terrain_idx {
-            let Obj::Terrain(t) = &self.objs[i] else { continue };
-            if !t.contains(p) {
-                continue;
+        match done {
+            Done::Nothing => {}
+            Done::Hit => self.events.push(Event::SunHit { sun: j }),
+            Done::Died => {
+                self.events.push(Event::SunHit { sun: j });
+                self.kill_sun(j);
             }
-            match t.def.kind {
-                TerrainKind::Force => fx.accel += t.accel,
-                TerrainKind::Speed => fx.speed *= (1.0 + t.def.speed_change / SPEED_CHANGE_UNIT).clamp(0.25, 4.0),
-                TerrainKind::Reflect => {}
-                TerrainKind::Minefield => {
-                    let p = rate_ppm(t.def.death_rate * t.def.density / 100.0);
-                    fx.mine_ppm = fx.mine_ppm.saturating_add(p);
+            Done::Captured => {
+                self.events.push(Event::SunCaptured { sun: j, faction });
+                self.completed.push((j, faction));
+            }
+            Done::Upgraded(level, maxed) => {
+                self.events.push(Event::SunUpgraded { sun: j, level });
+                if maxed {
+                    self.events.push(Event::SunMaxed { sun: j });
                 }
-                TerrainKind::Confusion => {
-                    fx.confuse_faction_ppm = fx.confuse_faction_ppm.saturating_add(rate_ppm(t.def.faction_change_rate));
-                    fx.confuse_order_ppm = fx.confuse_order_ppm.saturating_add(rate_ppm(t.def.lose_order_rate));
-                }
-                TerrainKind::Neutral => fx.neutral = true,
+                self.completed.push((j, faction));
             }
         }
-        fx
-    }
-
-    fn is_wall(&self, p: Vec2) -> bool {
-        self.terrain_idx.iter().any(|&i| matches!(&self.objs[i], Obj::Terrain(t) if t.def.kind == TerrainKind::Reflect && t.contains(p)))
+        left.max(0) as u32
     }
 
     // -------------------------------------------------------------------------------------------- the tick
@@ -914,567 +939,156 @@ impl Sim {
         }
         for c in cmds {
             let faction = match c {
-                Command::Order { faction, .. } | Command::Cancel { faction, .. } | Command::Surrender { faction } => *faction,
+                Command::Order { faction, .. } | Command::Surrender { faction } => *faction,
             };
             if let Err(why) = self.issue(c.clone()) {
                 self.events.push(Event::OrderRejected { faction, why });
             }
         }
+        if self.status != Status::Playing {
+            return;
+        }
         self.tick += 1;
+        self.completed.clear();
         self.update_objects();
         self.produce();
         self.run_ai();
+        self.self_defence();
         self.move_ships();
         self.combat();
         self.hazards();
         self.ships.retain(|s| s.alive);
-        if self.tick % ORPHAN_RECALL_TICKS == 0 {
-            self.recall_orphans();
+        if self.tick % MERGE_TICKS == 0 {
+            self.merge_crowds();
         }
         self.update_status();
-    }
-
-    /// Ships of a faction that owns no sun and sits idle advance on the nearest sun (capturing or hitting it),
-    /// so a faction cannot linger forever as a handful of stranded ships.
-    fn recall_orphans(&mut self) {
-        for f in 0..self.factions.len() as u8 {
-            if !self.factions[f as usize].alive || self.sun_count(f) > 0 {
-                continue;
-            }
-            for i in 0..self.ships.len() {
-                let sh = self.ships[i];
-                if sh.faction != f || sh.target != Target::None {
-                    continue;
-                }
-                let mut best: Option<(f64, usize)> = None;
-                for (j, su) in self.suns() {
-                    if su.present() {
-                        let d = su.pos.dist2(sh.pos);
-                        if best.map(|(bd, _)| d < bd).unwrap_or(true) {
-                            best = Some((d, j));
-                        }
-                    }
-                }
-                if let Some((_, j)) = best {
-                    self.ships[i].target = Target::Obj(j);
-                }
-            }
-        }
-    }
-
-    fn update_objects(&mut self) {
-        let tick = self.tick;
-        for i in 0..self.objs.len() {
-            match &mut self.objs[i] {
-                Obj::Sun(s) => {
-                    if let Some(or) = &s.orbit {
-                        s.pos = orbit_pos(s.centre, or, tick);
-                    }
-                    if let Some(f) = &mut s.fragile {
-                        match f.phase {
-                            FragilePhase::Gone { until } if tick >= until => {
-                                f.phase = FragilePhase::Rebuilding { from: tick, until: tick + f.rebuild_ticks as u64 };
-                            }
-                            FragilePhase::Rebuilding { until, .. } if tick >= until => {
-                                f.phase = FragilePhase::Intact;
-                                self.events.push(Event::SunRebuilt { sun: i });
-                            }
-                            _ => {}
-                        }
-                    }
-                }
-                Obj::Wormhole(w) => {
-                    if let Some(or) = &w.orbit {
-                        w.pos = orbit_pos(w.centre, or, tick);
-                    }
-                }
-                Obj::Gamma(g) => {
-                    let per_rev = (g.def.period.max(1) * GAMMA_TICKS_PER_PERIOD) as f64;
-                    g.phase += 360.0 / per_rev;
-                    if g.phase >= 360.0 {
-                        g.phase -= 360.0;
-                        if g.def.randomization > 0.0 {
-                            let j = self.rng.signed_unit() * g.def.randomization;
-                            g.offset += j;
-                        }
-                    }
-                    g.angle = g.def.rotation_deg + g.offset + g.phase;
-                }
-                Obj::Terrain(t) => {
-                    if t.def.switch_time > 0 && tick % t.def.switch_time as u64 == 0 {
-                        if t.def.kind == TerrainKind::Force && t.def.dir_switch != 0 {
-                            t.accel = -t.accel;
-                        } else {
-                            t.enabled = !t.enabled;
-                        }
-                    }
-                }
-                _ => {}
-            }
+        if self.tick % STATS_TICKS == 0 {
+            self.sample_stats();
         }
     }
 
     fn produce(&mut self) {
+        let tick = self.tick;
         for j in 0..self.objs.len() {
-            let mut spawn: Option<(u32, Repeat)> = None;
-            let mut cancel = false;
-            {
+            let (n, pos, r, faction, rings) = {
+                let ai_pct = match &self.objs[j] {
+                    Obj::Sun(s) if s.faction >= 0 && self.is_ai(s.faction as usize) => AI_PRODUCTION_PCT[self.cfg.ai_difficulty.min(3) as usize],
+                    _ => 100,
+                };
                 let Obj::Sun(s) = &mut self.objs[j] else { continue };
                 if s.faction < 0 || !s.present() || s.level == 0 {
                     continue;
                 }
-                s.accum += PRODUCTION_TENTHS[s.level as usize];
-                let mut n = 0;
-                while s.accum >= PRODUCTION_UNIT {
-                    s.accum -= PRODUCTION_UNIT;
-                    n += 1;
+                s.ring_timer += 1;
+                if s.ring_timer < RING_TICKS {
+                    continue;
                 }
-                if n > 0 {
-                    match s.repeat {
-                        Some(r) => spawn = Some((n, r)),
-                        None => s.stock += n,
-                    }
+                s.ring_timer = 0;
+                s.accum += RING_SHIPS[s.level as usize] * ai_pct;
+                let n = s.accum / 100;
+                s.accum %= 100;
+                if n == 0 {
+                    continue;
                 }
+                s.rings += 1;
+                s.last_ring = tick;
+                (n, s.pos, s.radius, s.faction as u8, s.rings)
+            };
+            // a ring of new ships, evenly spaced around the rim
+            let start = rings as f64 * 37.0;
+            for k in 0..n {
+                let ang = start + 360.0 * k as f64 / n as f64;
+                let d = dir_deg(ang);
+                let mut sh = self.new_ship(faction, pos + d * (r + 4.0), Target::None);
+                sh.heading = d;
+                self.join_orbit(&mut sh, j, None);
+                self.spawn(sh);
             }
-            if let Some((n, r)) = spawn {
-                let target_ok = match r.target {
-                    Target::Obj(t) => self.sun(t).map(|x| x.present()).unwrap_or(true) && self.valid_target(r.target),
-                    other => self.valid_target(other),
-                };
-                if target_ok {
-                    self.launch(j, n, r.target, r.then);
-                } else {
-                    cancel = true;
-                    self.sun_mut(j).unwrap().stock += n;
-                }
-            }
-            if cancel {
-                self.sun_mut(j).unwrap().repeat = None;
-            }
+            self.events.push(Event::Ring { sun: j, ships: n });
         }
     }
 
-    fn move_ships(&mut self) {
-        let mut ships = std::mem::take(&mut self.ships);
-        let mut pending: Vec<Pending> = Vec::new();
-        for s in ships.iter_mut() {
-            if s.alive {
-                self.move_ship(s, &mut pending);
-            }
-        }
-        // ships spawned while moving (none today) would be in self.ships; keep order stable
-        let mut extra = std::mem::take(&mut self.ships);
-        ships.append(&mut extra);
-        self.ships = ships;
-        for p in pending {
-            match p {
-                Pending::Invest { obj, faction, n } => self.invest(obj, faction, n),
-            }
-        }
-    }
-
-    fn move_ship(&mut self, s: &mut Ship, pending: &mut Vec<Pending>) {
-        if s.cooldown > 0 {
-            s.cooldown -= 1;
-        }
-        // terrain at the current position
-        let fx = self.terrain_fx(s.pos);
-        s.neutral = fx.neutral;
-        if fx.mine_ppm > 0 && self.rng.chance_ppm(fx.mine_ppm) {
-            s.alive = false;
-            return;
-        }
-        if fx.confuse_faction_ppm > 0 && self.rng.chance_ppm(fx.confuse_faction_ppm) {
-            let n = self.factions.len() as u32;
-            let others = self.rng.below(n - 1) as u8;
-            s.faction = if others >= s.faction { others + 1 } else { others };
-        }
-        if fx.confuse_order_ppm > 0 && self.rng.chance_ppm(fx.confuse_order_ppm) {
-            s.target = Target::None;
-            s.then = None;
-        }
-        if fx.accel != Vec2::ZERO {
-            s.push += fx.accel * FORCE_SCALE;
-            let l = s.push.len();
-            if l > PUSH_MAX {
-                s.push = s.push * (PUSH_MAX / l);
-            }
-            s.push = s.push * PUSH_DECAY_INSIDE;
-        } else {
-            s.push = s.push * PUSH_DECAY_OUTSIDE;
-        }
-
-        // resolve the target (lost targets become points)
-        if let Target::Obj(j) = s.target {
-            if let Some(Obj::Sun(su)) = self.objs.get(j) {
-                if !su.present() {
-                    s.target = Target::Point(su.pos);
-                }
-            }
-        }
-        if let Some(tp) = self.target_pos(s.target) {
-            let desired = (tp - s.pos).norm_or(s.heading);
-            s.heading = (s.heading + desired * STEER).norm_or(desired);
-        }
-        let moving = s.target != Target::None;
-        let mut newpos = s.pos;
-        if moving {
-            let vel = s.heading * (SHIP_SPEED * s.speed_mul * fx.speed) + s.push;
-            newpos = s.pos + vel;
-        } else {
-            newpos = newpos + s.push;
-        }
-        // reflect walls
-        if newpos != s.pos && self.is_wall(newpos) && !self.is_wall(s.pos) {
-            let nx = Vec2::new(newpos.x, s.pos.y);
-            let ny = Vec2::new(s.pos.x, newpos.y);
-            if self.is_wall(nx) {
-                s.heading.x = -s.heading.x;
-                s.push.x = -s.push.x;
-                newpos.x = s.pos.x;
-            }
-            if self.is_wall(ny) {
-                s.heading.y = -s.heading.y;
-                s.push.y = -s.push.y;
-                newpos.y = s.pos.y;
-            }
-            if self.is_wall(newpos) {
-                s.heading = -s.heading;
-                s.push = -s.push;
-                newpos = s.pos;
-            }
-        }
-        s.pos = newpos;
-
-        // wormholes
-        if s.cooldown == 0 {
-            for k in 0..self.wormholes.len() {
-                let wi = self.wormholes[k];
-                let (wpos, wsize, wdest) = match &self.objs[wi] {
-                    Obj::Wormhole(w) => (w.pos, w.size, w.dest),
-                    _ => continue,
-                };
-                if s.pos.dist2(wpos) < wsize * wsize && s.last_wormhole != wi as u32 + 1 {
-                    let di = if wdest >= 0 {
-                        wdest as usize
-                    } else if self.wormholes.len() < 2 {
-                        break;
-                    } else {
-                        let n = self.wormholes.len() as u32;
-                        let mut pick = self.rng.below(n - 1) as usize;
-                        if pick >= k {
-                            pick += 1;
-                        }
-                        self.wormholes[pick]
-                    };
-                    if let Some(Obj::Wormhole(d)) = self.objs.get(di) {
-                        s.pos = d.pos + s.heading * (d.size + WORMHOLE_EXIT_MARGIN);
-                        s.cooldown = WORMHOLE_COOLDOWN;
-                        s.last_wormhole = wi as u32 + 1;
-                        if s.target == Target::Obj(wi) {
-                            s.target = s.then.take().unwrap_or(Target::Point(s.pos));
-                        }
-                        self.events.push(Event::WormholeJump { obj: wi });
-                    }
-                    break;
-                }
-            }
-        }
-
-        // arrival
-        match s.target {
-            Target::Obj(j) => match self.objs.get(j) {
-                Some(Obj::Sun(su)) if su.present() => {
-                    if s.pos.dist(su.pos) < su.radius + ARRIVE_MARGIN {
-                        let f = s.faction;
-                        s.alive = false;
-                        self.arrive_at_sun(f, j);
-                    }
-                }
-                Some(Obj::WhiteHole(w)) => {
-                    if s.pos.dist(w.pos) < OBJECT_RADIUS {
-                        s.alive = false;
-                        pending.push(Pending::Invest { obj: j, faction: s.faction, n: 1 });
-                    }
-                }
-                Some(Obj::Supernova(w)) => {
-                    if s.pos.dist(w.pos) < OBJECT_RADIUS {
-                        s.alive = false;
-                        pending.push(Pending::Invest { obj: j, faction: s.faction, n: 1 });
-                    }
-                }
-                _ => {}
-            },
-            Target::Point(p) => {
-                if s.pos.dist(p) < POINT_ARRIVE {
-                    s.target = Target::None;
-                }
-            }
-            Target::None => {}
-        }
-        // idle ships touching a sun are absorbed by it
-        if s.alive && s.target == Target::None {
-            let mut hit = None;
-            for (j, su) in self.suns() {
-                if su.present() && s.pos.dist(su.pos) < su.radius + ARRIVE_MARGIN {
-                    hit = Some(j);
-                    break;
-                }
-            }
-            if let Some(j) = hit {
-                let f = s.faction;
-                s.alive = false;
-                self.arrive_at_sun(f, j);
-            }
-        }
-    }
-
-    fn invest(&mut self, obj: usize, faction: u8, n: u32) {
-        let tick = self.tick;
-        let fi = (faction as usize).min(3);
-        enum Fire {
-            Nova,
-            White,
-        }
-        let mut fire = None;
-        let mut rng_range = None;
-        match &mut self.objs[obj] {
-            Obj::Supernova(sn) if tick >= sn.dormant_until => {
-                sn.invest[fi] += n;
-                if sn.invest[fi] >= sn.def.required_investment {
-                    fire = Some(Fire::Nova);
-                }
-            }
-            Obj::WhiteHole(wh) if tick >= wh.dormant_until => {
-                wh.invest[fi] += n;
-                if wh.invest[fi] >= wh.def.required_investment {
-                    rng_range = Some((wh.def.start_return, wh.def.end_return.max(wh.def.start_return)));
-                    fire = Some(Fire::White);
-                }
-            }
-            _ => {}
-        }
-        match fire {
-            Some(Fire::Nova) => self.explode(obj, faction),
-            Some(Fire::White) => {
-                let (a, b) = rng_range.unwrap();
-                let count = a + self.rng.below(b - a + 1);
-                self.release_burst(obj, faction, count);
-            }
-            None => {}
-        }
-    }
-
-    fn explode(&mut self, obj: usize, faction: u8) {
-        let tick = self.tick;
-        let (pos, def) = match &mut self.objs[obj] {
-            Obj::Supernova(sn) => {
-                sn.invest = [0; 4];
-                sn.dormant_until = tick + sn.def.dormant_period as u64;
-                sn.last_blast = Some(tick);
-                (sn.pos, sn.def.clone())
-            }
-            _ => return,
-        };
-        let r2 = def.blast_radius * def.blast_radius;
-        if def.kill_enemy_units {
-            for s in self.ships.iter_mut() {
-                if s.faction != faction && s.pos.dist2(pos) <= r2 {
-                    s.alive = false;
-                }
-            }
-        }
-        if def.kill_enemy_suns {
-            for j in 0..self.objs.len() {
-                let hit = matches!(&self.objs[j], Obj::Sun(s) if s.present() && s.faction >= 0 && s.faction != faction as i8 && s.pos.dist2(pos) <= r2);
-                if hit {
-                    self.neutralize(j, true);
-                }
-            }
-        }
-        self.events.push(Event::Supernova { obj, faction });
-        self.spawn_residual(pos, faction, def.unit_residuals);
-    }
-
-    fn release_burst(&mut self, obj: usize, faction: u8, count: u32) {
-        let tick = self.tick;
-        let pos = match &mut self.objs[obj] {
-            Obj::WhiteHole(wh) => {
-                wh.invest = [0; 4];
-                wh.dormant_until = tick + wh.def.dormant_period as u64;
-                wh.pos
-            }
-            _ => return,
-        };
-        self.events.push(Event::WhiteHole { obj, faction, ships: count });
-        self.spawn_residual(pos, faction, count);
-    }
-
-    /// Spawn `n` ships of `faction` around `pos`, sending them to the nearest friendly sun.
-    fn spawn_residual(&mut self, pos: Vec2, faction: u8, n: u32) {
-        let target = self.nearest_own_sun(faction, pos).map(Target::Obj).unwrap_or(Target::None);
-        let base = self.target_pos(target).map(|t| (t - pos).norm_or(Vec2::new(1.0, 0.0))).unwrap_or(Vec2::new(1.0, 0.0));
-        for _ in 0..n {
-            let ang = self.rng.unit() * 360.0;
-            let r = 150.0 * self.rng.unit().sqrt();
-            let heading = base.rotate(self.rng.signed_unit() * LAUNCH_SPREAD_DEG * 6.0);
-            let speed_mul = 1.0 + self.rng.signed_unit() * SPEED_JITTER;
-            self.spawn(Ship {
-                id: 0,
-                pos: pos + dir_deg(ang) * r,
-                heading,
-                push: Vec2::ZERO,
-                faction,
-                target,
-                then: None,
-                speed_mul,
-                cooldown: 0,
-                last_wormhole: 0,
-                alive: true,
-                neutral: false,
-            });
-        }
-    }
-
-    fn combat(&mut self) {
-        const CELL: f64 = COMBAT_RANGE * 2.0;
-        let n = self.ships.len();
-        if n < 2 {
-            return;
-        }
-        let cell_of = |p: Vec2| -> (i64, i64) { ((p.x / CELL).floor() as i64, (p.y / CELL).floor() as i64) };
-        let key = |c: (i64, i64)| -> i64 { (c.0 + 100_000) * 1_000_000 + (c.1 + 100_000) };
-        let mut cells: Vec<(i64, u32)> = Vec::with_capacity(n);
-        for (i, s) in self.ships.iter().enumerate() {
-            if s.alive && !s.neutral {
-                cells.push((key(cell_of(s.pos)), i as u32));
-            }
-        }
-        cells.sort_unstable();
-        let r2 = COMBAT_RANGE * COMBAT_RANGE;
-        for i in 0..n {
-            let a = self.ships[i];
-            if !a.alive || a.neutral {
+    /// Elimination: a faction is out when it owns no living sun and cannot capture even one empty sun, or when one
+    /// rival owns every sun and is several times stronger. An out faction's ships vanish.
+    pub(crate) fn update_status(&mut self) {
+        let nf = self.factions.len();
+        let mut has_sun = vec![false; nf];
+        let mut strength = vec![0u32; nf];
+        let mut owners = Vec::new();
+        let mut any_unowned = false;
+        for (_, s) in self.suns() {
+            if !s.present() {
                 continue;
             }
-            let (cx, cy) = cell_of(a.pos);
-            let mut best: Option<(f64, usize)> = None;
-            for dx in -1..=1 {
-                for dy in -1..=1 {
-                    let k = key((cx + dx, cy + dy));
-                    let start = cells.partition_point(|c| c.0 < k);
-                    for c in &cells[start..] {
-                        if c.0 != k {
-                            break;
-                        }
-                        let j = c.1 as usize;
-                        let b = &self.ships[j];
-                        if j == i || !b.alive || b.faction == a.faction {
-                            continue;
-                        }
-                        let d = a.pos.dist2(b.pos);
-                        if d < r2 && best.map(|(bd, bj)| d < bd || (d == bd && j < bj)).unwrap_or(true) {
-                            best = Some((d, j));
-                        }
-                    }
+            if s.faction >= 0 {
+                has_sun[s.faction as usize] = true;
+                if !owners.contains(&s.faction) {
+                    owners.push(s.faction);
                 }
-            }
-            if let Some((_, j)) = best {
-                let bpos = self.ships[j].pos;
-                let bf = self.ships[j].faction;
-                self.ships[i].alive = false;
-                self.ships[j].alive = false;
-                self.events.push(Event::Combat { pos: (a.pos + bpos) * 0.5, a: a.faction, b: bf });
-            }
-        }
-    }
-
-    fn hazards(&mut self) {
-        let tick = self.tick;
-        for oi in 0..self.objs.len() {
-            match self.objs[oi].clone() {
-                Obj::Gamma(g) => {
-                    let d = dir_deg(g.angle);
-                    let half = g.def.width / 2.0;
-                    let beam = |p: Vec2, extra: f64| -> bool {
-                        let rel = p - g.pos;
-                        let fwd = rel.dot(d);
-                        let perp = (rel.x * d.y - rel.y * d.x).abs();
-                        fwd >= GAMMA_HUB && perp < half + extra
-                    };
-                    if g.def.kill_units {
-                        for s in self.ships.iter_mut() {
-                            if s.alive && beam(s.pos, 0.0) {
-                                s.alive = false;
-                            }
-                        }
-                    }
-                    if g.def.kill_suns {
-                        for j in 0..self.objs.len() {
-                            let hit = matches!(&self.objs[j], Obj::Sun(s) if s.present() && (s.faction >= 0 || s.cap_progress > 0 || s.fragile.is_some()) && beam(s.pos, s.radius));
-                            if hit {
-                                self.neutralize(j, true);
-                            }
-                        }
-                    }
-                }
-                Obj::Shock(sh) => {
-                    let d = &sh.def;
-                    if tick < d.dormant as u64 || d.period == 0 {
-                        continue;
-                    }
-                    let age = (tick - d.dormant as u64) % d.period as u64;
-                    if age >= d.lifetime as u64 {
-                        continue;
-                    }
-                    let reach = d.speed * age as f64 + d.start_offset;
-                    let thick = 60.0 + d.speed;
-                    if d.kind == "st_incircle" {
-                        for s in self.ships.iter_mut() {
-                            if s.alive && (s.pos.dist(sh.pos) - reach).abs() < thick {
-                                s.alive = false;
-                            }
-                        }
-                    } else {
-                        // a straight wall travelling perpendicular to `linerotation`, starting 12000 units behind
-                        let dir = dir_deg(d.line_rotation_deg);
-                        let at = reach - 12000.0;
-                        for s in self.ships.iter_mut() {
-                            let along = (s.pos - sh.pos).dot(Vec2::new(-dir.y, dir.x));
-                            if s.alive && (along - at).abs() < thick {
-                                s.alive = false;
-                            }
-                        }
-                    }
-                }
-                _ => {}
-            }
-        }
-    }
-
-    fn update_status(&mut self) {
-        let nf = self.factions.len();
-        let mut has = vec![false; nf];
-        for (_, s) in self.suns() {
-            if s.faction >= 0 && s.present() {
-                has[s.faction as usize] = true;
+            } else {
+                any_unowned = true;
             }
         }
         for s in &self.ships {
             if s.alive {
-                has[s.faction as usize] = true;
+                strength[s.faction as usize] += s.strength;
             }
         }
+        let monopoly = if !any_unowned && owners.len() == 1 { Some(owners[0] as usize) } else { None };
+        let mut out = Vec::new();
         for f in 0..nf {
-            if self.factions[f].alive && !has[f] {
-                self.factions[f].alive = false;
-                self.events.push(Event::Eliminated { faction: f as u8 });
+            if !self.factions[f].alive {
+                continue;
+            }
+            let broke = !has_sun[f] && strength[f] < CAPTURE_COST as u32;
+            let crushed = monopoly.is_some_and(|g| g != f && strength[g] >= strength[f].saturating_mul(DOMINANCE_RATIO));
+            if broke || crushed {
+                out.push(f);
             }
         }
+        for f in out {
+            self.factions[f].alive = false;
+            for s in self.ships.iter_mut() {
+                if s.faction as usize == f {
+                    s.alive = false;
+                }
+            }
+            self.events.push(Event::Eliminated { faction: f as u8 });
+        }
+        self.ships.retain(|s| s.alive);
+        let before = self.status;
         if !self.factions[0].alive {
             self.status = Status::Lost;
         } else if self.factions.iter().skip(1).all(|f| !f.alive) {
             self.status = Status::Won;
         }
+        if before == Status::Playing && self.status != Status::Playing {
+            self.sample_stats();
+        }
+    }
+
+    pub(crate) fn sample_stats(&mut self) {
+        let nf = self.factions.len();
+        let mut ships = vec![0; nf];
+        for s in &self.ships {
+            if s.alive {
+                ships[s.faction as usize] += s.strength;
+            }
+        }
+        let production = (0..nf).map(|f| self.production(f as u8)).collect();
+        let suns = (0..nf).map(|f| self.sun_count(f as u8) as u32).collect();
+        let losses = self.factions.iter().map(|f| f.combat_losses).collect();
+        if self.stats.last().is_some_and(|s| s.tick == self.tick) {
+            self.stats.pop();
+        }
+        self.stats.push(Sample { tick: self.tick, ships, production, losses, suns });
+    }
+}
+
+fn sun_garrison(o: &Object) -> Option<u32> {
+    match o {
+        Object::Sun(s) | Object::OrbitingSun(s, _) => Some(s.starting_units),
+        Object::FragileSun(f) => Some(f.sun.starting_units),
+        _ => None,
     }
 }

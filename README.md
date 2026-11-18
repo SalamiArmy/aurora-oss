@@ -5,8 +5,8 @@ crush rival factions. Two to four factions per level, special objects (orbiting 
 supernovas, gamma rays, terrain zones) and an AI opponent. Written in Rust; the simulation is headless and
 deterministic.
 
-> **Status: early.** The repository currently holds the content and documentation. The game core is being written
-> under a clean-room process; see below.
+> **Status: early but playable.** The game follows `cleanroom/public/RULES.md` (written under a clean-room process; see
+> below). Balance is still rough.
 
 ## What's here
 | Path | What |
@@ -29,7 +29,7 @@ python tools/gen_oss_assets.py assets        # needs numpy and soundfile
 |---|---|
 | `au2-map` | `.au2` parser/validator and `levels/levels.txt` index loader. Errors carry line numbers; a test loads every shipped level. |
 | `au2-sim` | Headless deterministic simulation (fixed 60 Hz step, seeded RNG, no wall clock), AI, and a unit test per rule. |
-| `au2-app` | Playable desktop app: winit window + softbuffer, software-rendered; mouse and touch orders. Sound-effect code (`audio.rs`, rodio) exists but is not wired in yet. |
+| `au2-app` | Playable desktop app: winit window + softbuffer, software-rendered; mouse and touch area selection, results screen. Sound-effect code (`audio.rs`, rodio) exists but is not wired in yet. |
 | `au2-android` | Android entry point (NativeActivity cdylib) around `au2-app`; empty on other targets. |
 | `au2-music` | Synthesiser and procedural songs (not yet wired into the app). |
 
@@ -47,9 +47,17 @@ On other platforms use plain `cargo`. `au2-app` finds `levels/` and `assets/` by
 directory or executable; override with `--root DIR` or `AU2_ROOT`. Build with `--no-default-features` for a silent
 app (no rodio / audio libraries). `--snapshot out.png --ticks N` renders a headless AI-vs-AI frame to a PNG.
 
-Controls (also on F1 in game): left-click/drag-lasso to select your suns, right-click (or click) a target to send
-ships, the bottom bar sets the send fraction (25/50/100%), repeat/cancel orders, pause, speed, fit-view and menu;
-wheel zooms, middle-drag pans, Esc returns to the menu.
+Controls (also on F1 in game): every ship is visible, and orders pick **ships by area**. Left-drag a circle to select
+your ships inside it (circling, hovering and flying alike; Shift adds), or click a sun with nothing selected to select
+the area around it. Then click (left or right) a target: your sun (reinforce / upgrade), an empty sun (capture), an
+enemy sun (attack), a wormhole, white hole or supernova, or empty space (the swarm stops and hovers there). Sending
+clears the selection; Esc deselects (then opens the menu). Ctrl+A selects all your ships. The bottom bar has
+Pause, the game speed (Slow / Normal / Fast), Fit, All, None and Menu; wheel zooms, middle-drag or WASD pans, + / -
+change speed. Each sun shows a health bar (green) and a growth bar (white); a captured or upgraded sun costs about a
+hundred ships. When the game ends a results screen shows graphs of ships, production and combat losses per faction.
+
+`cargo run --release -p au2-sim --example play -- <level> [minutes] [difficulty] [seed] [idle]` plays a level headless
+and prints a timeline; `... --example play -- all 20 idle` runs every level in parallel against an idle human.
 
 ## Android (experimental, untested on a device)
 Tagged releases include `aurora-oss-<tag>-android-arm64.apk` (arm64-v8a, Android 8.0+). It is signed with the release
@@ -57,11 +65,11 @@ key if the repository secrets `ANDROID_KEYSTORE_B64`, `ANDROID_KEYSTORE_PASSWORD
 otherwise with a throwaway debug key (the workflow log and a warning say which). It has **not been run on any device or
 emulator**; treat it as a starting point.
 
-Touch controls: tap one of your suns to select it; with suns selected, tap a target (a sun, wormhole, white hole,
-supernova or empty space) to send ships; tap an already selected sun again to send the selection to it (upgrade).
-Drag from one of your suns to lasso-select; drag from anywhere else to pan; pinch to zoom. The bottom bar sets the send
-fraction, repeat/cancel, pause, speed, fit, and **All** (select all your suns). The Back button opens the pause menu.
-The UI is drawn at a lower resolution and scaled up, and the board is re-fitted when the screen rotates. No sound yet.
+Touch controls: drag one finger to draw a circle around ships to select them; tap a sun (with nothing selected) to
+select the area around it; then tap a target to send them. Two fingers pan and pinch-zoom. The bottom bar has
+pause, speed, fit, **All** (select all your ships), **None** (deselect) and the menu. The Back button deselects, then
+opens the pause menu. The UI is drawn at a lower resolution and scaled up, and the board is re-fitted when the screen
+rotates. No sound yet.
 
 Build it yourself (Linux/macOS/WSL shell; needs the Android SDK with `platforms;android-33` and build-tools, an NDK, a
 JDK, `rustup target add aarch64-linux-android` and `cargo install cargo-apk --version 0.10.0 --locked`):
@@ -75,13 +83,20 @@ Type-check only, without an NDK (use a toolchain whose host tools build, e.g. th
 `cargo check --target aarch64-linux-android -p au2-android`.
 
 ## Not implemented / limitations
-- `au2-music` is not wired into the app (optional per the brief); only sound effects play.
-- Rendering is flat 2D software drawing; `assets/` textures and meshes are not used (sfx only).
+- Everything in `cleanroom/public/RULES.md` sections 1-9 is implemented; `DECISIONS.md` lists every interpretation.
+  The game was rebuilt for the revised RULES.md (`cb9bf25`); balance numbers are first guesses tuned with AI-vs-AI
+  runs, not with human play.
+- Section 10 (presentation hints) is partly done: glowing suns with level rings, damage arcs, pulses, order and
+  level-start flashes, sun death bursts. **No sound**: the rhythmic combat notes and upgrade tones are not
+  implemented (`audio.rs` exists but is not wired in), and `au2-music` is not wired into the app.
+- No shipped level uses white holes or shockwaves; they are covered by unit tests only.
+- The AI plans with full knowledge of the board even under fog (its orders still obey the fog refusal rule).
+- Rendering is flat 2D software drawing; `assets/` textures and meshes are not used.
 - Runtime-state and cosmetic map fields are ignored; see `DECISIONS.md` for each spec ambiguity and choice.
 - The windowed apps were verified by building, unit tests (including the touch-gesture logic) and headless snapshot
   rendering; interactive play was not exercised in an automated test. **The Android APK has never been run on a device
-  or emulator**: so far only `cargo check --target aarch64-linux-android` passes. The APK packaging (cargo-apk, SDK/NDK
-  setup, signing) is unverified until the first workflow run, and the Android build has no sound.
+  or emulator** by this work: only `cargo check --target aarch64-linux-android` passes locally, and the Android build
+  has no sound.
 
 ## Licence
 Dual-licensed under [MIT](LICENSE-MIT) or [Apache-2.0](LICENSE-APACHE), at your option. See [NOTICE](NOTICE).

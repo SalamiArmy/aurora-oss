@@ -38,6 +38,13 @@ impl Vec2 {
             self * (1.0 / l)
         }
     }
+    /// Rotated a quarter turn counter-clockwise.
+    pub fn perp(self) -> Vec2 {
+        Vec2::new(-self.y, self.x)
+    }
+    pub fn cross(self, o: Vec2) -> f64 {
+        self.x * o.y - self.y * o.x
+    }
     pub fn rotate(self, deg: f64) -> Vec2 {
         let (s, c) = (sin_deg(deg), cos_deg(deg));
         Vec2::new(self.x * c - self.y * s, self.x * s + self.y * c)
@@ -113,6 +120,28 @@ pub fn sin_deg(d: f64) -> f64 {
 pub fn cos_deg(d: f64) -> f64 {
     cos_rad(d * (PI / 180.0))
 }
+/// Approximate `atan2(y, x)` in degrees, in (-180, 180]. Only basic arithmetic (deterministic everywhere); error is
+/// below 0.3 degrees, which is plenty for placing ships on orbits.
+pub fn atan2_deg(y: f64, x: f64) -> f64 {
+    if x == 0.0 && y == 0.0 {
+        return 0.0;
+    }
+    let (ax, ay) = (x.abs(), y.abs());
+    // atan(t) for t in [0, 1]: pi/4*t + 0.273*t*(1-t)
+    let (t, swap) = if ay > ax { (ax / ay, true) } else { (ay / ax, false) };
+    let mut a = (PI / 4.0) * t + 0.273 * t * (1.0 - t);
+    if swap {
+        a = PI / 2.0 - a;
+    }
+    if x < 0.0 {
+        a = PI - a;
+    }
+    if y < 0.0 {
+        a = -a;
+    }
+    a * (180.0 / PI)
+}
+
 /// Unit vector at `deg` degrees.
 pub fn dir_deg(d: f64) -> Vec2 {
     Vec2::new(cos_deg(d), sin_deg(d))

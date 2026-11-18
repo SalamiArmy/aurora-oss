@@ -1,7 +1,7 @@
 //! Aurora RTS desktop front-end: command line, repository-root discovery and the headless snapshot mode. The game,
 //! renderer and window loop live in the `au2_app` library (shared with the Android entry crate).
 
-use au2_app::game::{self, Game, Input};
+use au2_app::game::{Game, Input};
 use au2_app::gfx::Canvas;
 use au2_app::{png, render, App, FsSource, LevelSource};
 use au2_sim::SimConfig;
@@ -101,14 +101,19 @@ fn snapshot(source: &FsSource, args: &Args, out: &Path) -> Result<(), String> {
     g.sim = au2_sim::Sim::new(&map, SimConfig { seed: args.seed.unwrap_or(1), ai_difficulty: e.difficulty.max(1), human_ai: true, enable_ai: true });
     for _ in 0..args.ticks {
         g.sim.step(&[]);
-        for ev in g.sim.take_events() {
-            if let au2_sim::Event::Combat { pos, a, .. } = ev {
-                g.sparks.push(game::Spark { pos, age: 0.2, color_faction: a });
-            }
+        let events = g.sim.take_events();
+        for s in g.sparks.iter_mut() {
+            s.age += 1.0 / 60.0;
         }
         g.sparks.retain(|s| s.age < 0.5);
+        g.handle_events(events);
     }
-    g.selection = g.own_sun_ids().into_iter().take(2).collect();
+    g.pings.clear();
+    // show a selection: the cloud around the first sun the human still owns
+    if let Some(&i) = g.own_sun_ids().first() {
+        let (c, r) = (g.sim.sun(i).unwrap().pos, g.sim.sun_select_radius(i));
+        g.select_circle(c, r, false);
+    }
     g.clock = args.ticks as f32 / 60.0;
     let mut c = Canvas::new(w, h);
     let input = Input { mouse: (w as f32 / 2.0, h as f32 / 2.0), ..Default::default() };

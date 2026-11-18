@@ -5,3 +5,7 @@ members = ["crates/au2-music", "crates/au2-map", "crates/au2-sim", "crates/au2-a
 [workspace.package]
 edition = "2021"
 version = "0.1.0"
+
+# The simulation runs thousands of ships per tick; keep it fast in debug builds and tests too.
+[profile.dev.package.au2-sim]
+opt-level = 3
