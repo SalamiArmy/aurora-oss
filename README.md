@@ -29,7 +29,7 @@ python tools/gen_oss_assets.py assets        # needs numpy and soundfile
 |---|---|
 | `au2-map` | `.au2` parser/validator and `levels/levels.txt` index loader. Errors carry line numbers; a test loads every shipped level. |
 | `au2-sim` | Headless deterministic simulation (fixed 60 Hz step, seeded RNG, no wall clock), AI, and a unit test per rule. |
-| `au2-app` | Playable desktop app: winit window + softbuffer, software-rendered; mouse and touch area selection, results screen. Sound-effect code (`audio.rs`, rodio) exists but is not wired in yet. |
+| `au2-app` | Playable desktop app: winit window + softbuffer, software-rendered 3D view (perspective, lit suns, parallax stars); mouse and touch area selection, results screen. Sound-effect code (`audio.rs`, rodio) exists but is not wired in yet. |
 | `au2-android` | Android entry point (NativeActivity cdylib) around `au2-app`; empty on other targets. |
 | `au2-music` | Synthesiser and procedural songs (not yet wired into the app). |
 
@@ -91,7 +91,8 @@ Type-check only, without an NDK (use a toolchain whose host tools build, e.g. th
   implemented (`audio.rs` exists but is not wired in), and `au2-music` is not wired into the app.
 - No shipped level uses white holes or shockwaves; they are covered by unit tests only.
 - The AI plans with full knowledge of the board even under fog (its orders still obey the fog refusal rule).
-- Rendering is flat 2D software drawing; `assets/` textures and meshes are not used.
+- Rendering is software 3D on the CPU (perspective board, lit sphere suns, parallax starfield; see `DECISIONS.md`):
+  no GPU is used. Only `assets/rock.bin` of the generated meshes/textures is used (the fragile-sun wreck).
 - Runtime-state and cosmetic map fields are ignored; see `DECISIONS.md` for each spec ambiguity and choice.
 - The windowed apps were verified by building, unit tests (including the touch-gesture logic) and headless snapshot
   rendering; interactive play was not exercised in an automated test. **The Android APK has never been run on a device

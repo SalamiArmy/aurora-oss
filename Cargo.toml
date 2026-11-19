@@ -9,3 +9,5 @@ version = "0.1.0"
 # The simulation runs thousands of ships per tick; keep it fast in debug builds and tests too.
 [profile.dev.package.au2-sim]
 opt-level = 3
+[profile.dev.package.au2-app]
+opt-level = 2

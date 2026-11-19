@@ -117,10 +117,16 @@ fn snapshot(source: &FsSource, args: &Args, out: &Path) -> Result<(), String> {
     g.clock = args.ticks as f32 / 60.0;
     let mut c = Canvas::new(w, h);
     let input = Input { mouse: (w as f32 / 2.0, h as f32 / 2.0), ..Default::default() };
-    render::draw_game(&mut c, &g, &input);
-    render::draw_ui(&mut c, &mut g, &Input::default());
+    // render a few times and report the cost of one frame (the last one is written out)
+    let t0 = std::time::Instant::now();
+    const FRAMES: u32 = 5;
+    for _ in 0..FRAMES {
+        render::draw_game(&mut c, &g, &input);
+        render::draw_ui(&mut c, &mut g, &Input::default());
+    }
+    let frame_ms = t0.elapsed().as_secs_f64() * 1000.0 / FRAMES as f64;
     std::fs::write(out, png::encode(w as u32, h as u32, &c.buf)).map_err(|e| format!("cannot write {}: {e}", out.display()))?;
-    println!("wrote {} ({} ticks, {} ships, status {:?})", out.display(), g.sim.tick, g.sim.ships.len(), g.sim.status);
+    println!("wrote {} ({} ticks, {} ships, status {:?}, {:.1} ms per frame)", out.display(), g.sim.tick, g.sim.ships.len(), g.sim.status, frame_ms);
     Ok(())
 }
 

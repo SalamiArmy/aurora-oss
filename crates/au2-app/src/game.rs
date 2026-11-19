@@ -3,6 +3,7 @@
 //! Orders select **ships by area**: draw a circle (lasso) or tap a sun to select the area around it, then tap a target.
 //! The selection is a set of ship ids (circling, hovering and flying ships alike); it is cleared once an order is sent.
 
+use crate::view3d::{Camera, V3};
 use au2_map::{LevelEntry, Map, Object};
 use au2_sim::math::Vec2;
 use au2_sim::rules::TICKS_PER_SEC;
@@ -11,6 +12,8 @@ use std::collections::HashSet;
 use winit::keyboard::KeyCode;
 
 pub const BAR_H: f32 = 44.0;
+/// Height of the info strip at the top that `fit` keeps the board out of.
+pub const HUD_TOP: f32 = 76.0;
 
 #[derive(Default)]
 pub struct Input {
@@ -257,17 +260,72 @@ impl Game {
         if x0 > x1 {
             (x0, x1, y0, y1) = (-5000.0, 5000.0, -5000.0, 5000.0);
         }
-        self.cam = [(x0 + x1) / 2.0, (y0 + y1) / 2.0];
+        // perspective: find the largest zoom at which the board's four corners are on screen, and centre their
+        // projection (the near edge is drawn bigger than the far one, so the look-at point sits a little off-centre)
         let (vw, vh) = (view.0.max(100.0), (view.1 - self.bar_h).max(100.0));
-        self.zoom = (vw / (x1 - x0)).min(vh / (y1 - y0)) * 0.95;
+        self.cam = [(x0 + x1) / 2.0, (y0 + y1) / 2.0];
+        let corners = [(x0, y0), (x1, y0), (x0, y1), (x1, y1)];
+        let fits = |g: &Game, zoom: f32| -> Option<(f32, f32)> {
+            let c = Camera::new(g.cam[0], g.cam[1], zoom, vw / 2.0, vh / 2.0, vh);
+            let (mut top, mut bottom) = (f32::MAX, f32::MIN);
+            for &(x, y) in &corners {
+                let p = c.project(V3::new(x, y, 0.0))?;
+                if p.x < vw * 0.03 || p.x > vw * 0.97 {
+                    return None;
+                }
+                top = top.min(p.y);
+                bottom = bottom.max(p.y);
+            }
+            // leave the top HUD strip clear
+            (bottom - top <= vh * 0.97 - HUD_TOP).then_some((top, bottom))
+        };
+        for _ in 0..3 {
+            let (mut lo, mut hi) = (0.0005f32, 2.0f32);
+            for _ in 0..40 {
+                let mid = (lo * hi).sqrt();
+                if fits(self, mid).is_some() {
+                    lo = mid;
+                } else {
+                    hi = mid;
+                }
+            }
+            self.zoom = lo;
+            // shift the look-at point so the projected board is vertically centred
+            if let Some((top, bottom)) = fits(self, lo) {
+                let mid = (top + bottom) / 2.0 - (HUD_TOP + vh * 0.01) / 2.0;
+                let c = self.camera(view);
+                if let Some(w) = c.unproject(vw / 2.0, mid, 0.0) {
+                    self.cam[1] += w.y - self.cam[1];
+                }
+            }
+        }
     }
 
+    /// The perspective camera for this frame.
+    pub fn camera(&self, view: (f32, f32)) -> Camera {
+        let vh = (view.1 - self.bar_h).max(1.0);
+        Camera::new(self.cam[0], self.cam[1], self.zoom, view.0 / 2.0, vh / 2.0, vh)
+    }
+
+    /// Screen position of a ground point (off-screen far away if it is behind the camera).
     pub fn to_screen(&self, p: Vec2, view: (f32, f32)) -> (f32, f32) {
-        (view.0 / 2.0 + (p.x as f32 - self.cam[0]) * self.zoom, (view.1 - self.bar_h) / 2.0 - (p.y as f32 - self.cam[1]) * self.zoom)
+        match self.camera(view).project(V3::new(p.x as f32, p.y as f32, 0.0)) {
+            Some(q) => (q.x, q.y),
+            None => (-1.0e5, -1.0e5),
+        }
     }
 
+    /// Screen pixels per world unit at a ground point.
+    pub fn scale_at(&self, p: Vec2, view: (f32, f32)) -> f32 {
+        self.camera(view).project(V3::new(p.x as f32, p.y as f32, 0.0)).map(|q| q.scale).unwrap_or(0.0)
+    }
+
+    /// The ground point under a screen position.
     pub fn to_world(&self, s: (f32, f32), view: (f32, f32)) -> Vec2 {
-        Vec2::new(((s.0 - view.0 / 2.0) / self.zoom + self.cam[0]) as f64, (((view.1 - self.bar_h) / 2.0 - s.1) / self.zoom + self.cam[1]) as f64)
+        let c = self.camera(view);
+        // above the horizon: clamp to just below it
+        let w = c.unproject(s.0, s.1, 0.0).or_else(|| c.unproject(s.0, c.cy - c.f * 0.4, 0.0)).unwrap_or(V3::new(self.cam[0], self.cam[1], 0.0));
+        Vec2::new(w.x as f64, w.y as f64)
     }
 
     pub fn toast(&mut self, s: impl Into<String>) {
@@ -285,10 +343,19 @@ impl Game {
     /// Zoom by `factor` keeping the world point under screen position `at` fixed.
     pub fn zoom_at(&mut self, at: (f32, f32), factor: f32, view: (f32, f32)) {
         let before = self.to_world(at, view);
-        self.zoom = (self.zoom * factor).clamp(0.01, 0.6);
-        let after = self.to_world(at, view);
-        self.cam[0] += (before.x - after.x) as f32;
-        self.cam[1] += (before.y - after.y) as f32;
+        self.zoom = (self.zoom * factor).clamp(0.005, 0.6);
+        for _ in 0..2 {
+            let after = self.to_world(at, view);
+            self.cam[0] += (before.x - after.x) as f32;
+            self.cam[1] += (before.y - after.y) as f32;
+        }
+    }
+
+    /// Move the camera so the ground point under screen `from` ends up under screen `to` (drag panning).
+    pub fn drag_pan(&mut self, from: (f32, f32), to: (f32, f32), view: (f32, f32)) {
+        let (a, b) = (self.to_world(from, view), self.to_world(to, view));
+        self.cam[0] += (a.x - b.x) as f32;
+        self.cam[1] += (a.y - b.y) as f32;
     }
 
     /// Is this ship id selected? (`selection` is sorted.)
@@ -423,8 +490,8 @@ impl Game {
                 self.zoom_at(input.mouse, input.pinch, view);
             }
             if input.pan_px != (0.0, 0.0) {
-                self.cam[0] -= input.pan_px.0 / self.zoom;
-                self.cam[1] += input.pan_px.1 / self.zoom;
+                let to = input.mouse;
+                self.drag_pan((to.0 - input.pan_px.0, to.1 - input.pan_px.1), to, view);
             }
             if input.cancel_drag {
                 self.drag = None;
@@ -434,8 +501,8 @@ impl Game {
                 match self.pan {
                     None => self.pan = Some((input.mouse, self.cam)),
                     Some((m0, c0)) => {
-                        self.cam[0] = c0[0] - (input.mouse.0 - m0.0) / self.zoom;
-                        self.cam[1] = c0[1] + (input.mouse.1 - m0.1) / self.zoom;
+                        self.cam = c0;
+                        self.drag_pan(m0, input.mouse, view);
                     }
                 }
             } else {
@@ -443,7 +510,8 @@ impl Game {
             }
 
             let wp = self.to_world(input.mouse, view);
-            let slack = ((if input.touch_mode { 22.0 } else { 6.0 }) / self.zoom) as f64;
+            let k = self.scale_at(wp, view).max(1e-4);
+            let slack = ((if input.touch_mode { 22.0 } else { 6.0 }) / k) as f64;
             // right click = order (or nothing without a selection)
             if input.right_pressed && !over_bar {
                 if self.selection.is_empty() {
@@ -462,7 +530,7 @@ impl Game {
                 self.lasso = vec![wp];
             }
             if self.drag.is_some() && input.left_down {
-                if self.lasso.last().map(|l| l.dist(wp) * self.zoom as f64 > 4.0).unwrap_or(true) {
+                if self.lasso.last().map(|l| l.dist(wp) * k as f64 > 4.0).unwrap_or(true) {
                     self.lasso.push(wp);
                 }
             }
@@ -470,7 +538,7 @@ impl Game {
                 if let Some(start) = self.drag.take() {
                     // how far the drag ever got from where it began (a closed lasso ends where it started)
                     let path = std::mem::take(&mut self.lasso);
-                    let reach = path.iter().map(|p| p.dist(path[0])).fold(0.0f64, f64::max) * self.zoom as f64;
+                    let reach = path.iter().map(|p| p.dist(path[0])).fold(0.0f64, f64::max) * k as f64;
                     let moved = ((input.mouse.0 - start.0).abs() + (input.mouse.1 - start.1).abs()).max(reach as f32);
                     if moved > input.drag_slop() {
                         let mut path = path;

@@ -179,6 +179,37 @@ See the README for controls. Choices are listed there because they are user-visi
 - A dying sun shows a burst of rays and debris in its owner's colour, larger for supergiants. All suns flash (a ping)
   when a level starts and the target of an order flashes.
 
+## 3D presentation (`view3d.rs`, `draw3d.rs`, `render.rs`)
+The owner asked for a more 3D look: parallax stars and 3D models for the suns. The board stays a 2D simulation; this is
+presentation only and nothing in `au2-sim` changed.
+- **Software 3D, not the GPU.** wgpu was the alternative. Rejected for now because (1) on the GNU Windows toolchain its
+  recent `windows`/`windows-sys` dependencies are likely to need `dlltool`, the problem that pins softbuffer to 0.4.6
+  (not tried: adding wgpu was not attempted); (2) Android would
+  trade the working `ANativeWindow` presenter for a Vulkan/GLES surface that cannot be tried here without a device;
+  (3) the headless `--snapshot` PNG and the render tests would need an offscreen GPU adapter, which CI runners and
+  this machine may not have. The software path keeps all three working unchanged. The cost is CPU time: 5-13 ms per
+  1280x800 frame in release on this machine (fog levels are the heaviest), and much less on a phone, whose canvas is
+  drawn at about 480 px on the short side and scaled up. `au2-app` is built at `opt-level = 2` in dev builds too.
+- **Camera**: perspective, 32 degree vertical field of view, tilted 48 degrees from straight down towards the far
+  (+y) edge. `Game::zoom` is now "pixels per world unit at the look-at point"; `to_screen` / `to_world` project and
+  ray-cast onto the board plane, so picking, lasso circles and drag-panning work on the tilted board. `fit` searches the
+  largest zoom that keeps the board's corners on screen, clear of the top info strip, and centres them vertically.
+- **Suns** are ray-traced spheres (exact under perspective), centred on the board so the circling ships ring their
+  equator: a key light from the upper left, emissive glow (brighter when owned and with level), a rim and a specular
+  highlight, and a slowly spinning banded noise surface generated in code (no PNG decoder needed). They are drawn 1.4x
+  their simulated radius so they read as solid bodies at the fitted zoom (clouds start at 2.4 radii, so they clear).
+  White holes and supernovas are spheres too. A broken fragile sun is a few tumbling rocks: the faceted rock mesh in
+  `assets/rock.bin` (compiled in with `include_bytes!`, so Android needs no asset plumbing), flat-shaded by a small
+  depth-tested triangle rasterizer.
+- **Depth**: solid surfaces write a per-pixel depth buffer on the canvas; ships, rings on the board and level rings are
+  depth-tested, so ships behind a sun are hidden by it. Board-plane things (terrain tiles, gamma lanes, shockwaves,
+  wormhole portals, fog discs, lasso) are projected polygons / ellipses, clipped at the near plane.
+- **Starfield**: four layers of stars on planes 1500 to 40000 units *below* the board, seen through the same camera,
+  so deeper layers move less when panning and zooming (true parallax), plus a few faint nebulae on the deepest layer.
+  Stars come from a hashed lattice per layer; when zoomed out the lattice is sampled more coarsely (only every 2nd,
+  4th... cell), which keeps a subset of the same stars instead of re-rolling them.
+- HUD, bars, pips and text stay flat screen overlays. The menu keeps the old 2D star background.
+
 ## Android front end
 None of this has run on a device; it is verified only by `cargo check --target aarch64-linux-android -p au2-android`
 (with the MSVC host toolchain: the GNU one lacks `dlltool` for the host-side build dependencies) plus the desktop tests.

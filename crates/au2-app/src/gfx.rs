@@ -9,11 +9,14 @@ pub struct Canvas {
     pub w: i32,
     pub h: i32,
     pub buf: Vec<u32>,
+    /// Depth (distance along the view direction) of the nearest solid 3D surface per pixel; `f32::MAX` = none.
+    pub depth: Vec<f32>,
 }
 
 impl Canvas {
     pub fn new(w: i32, h: i32) -> Self {
-        Canvas { w, h, buf: vec![0; (w.max(1) * h.max(1)) as usize] }
+        let n = (w.max(1) * h.max(1)) as usize;
+        Canvas { w, h, buf: vec![0; n], depth: vec![f32::MAX; n] }
     }
 
     pub fn resize(&mut self, w: i32, h: i32) {
@@ -21,6 +24,29 @@ impl Canvas {
             self.w = w;
             self.h = h;
             self.buf = vec![0; (w.max(1) * h.max(1)) as usize];
+            self.depth = vec![f32::MAX; self.buf.len()];
+        }
+    }
+
+    pub fn clear_depth(&mut self) {
+        self.depth.fill(f32::MAX);
+    }
+
+    /// Is a point at `depth` in front of whatever solid surface is drawn at pixel (x, y)?
+    #[inline]
+    pub fn visible(&self, x: i32, y: i32, depth: f32) -> bool {
+        x >= 0 && y >= 0 && x < self.w && y < self.h && depth <= self.depth[(y * self.w + x) as usize]
+    }
+
+    /// Opaque pixel with a depth write (if nearer than what is there).
+    #[inline]
+    pub fn put_depth(&mut self, x: i32, y: i32, depth: f32, c: Rgb, a: f32) {
+        if !self.visible(x, y, depth) {
+            return;
+        }
+        self.blend(x, y, c, a);
+        if a >= 0.5 {
+            self.depth[(y * self.w + x) as usize] = depth;
         }
     }
 
