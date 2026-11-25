@@ -56,8 +56,8 @@ the revised text; the earlier interpretations (hidden stock, percentage orders, 
   Ships in flight are simply re-targeted. Ids (rather than re-evaluating an area when the order applies) mean the ships
   the player saw highlighted are exactly the ones that go, and a replay stays exact.
 - Selecting: `Sim::ships_in_circle(faction, centre, r)`; tapping a sun selects a circle of `cloud_radius + 60` (larger
-  for bigger suns). The app turns a drawn lasso into a circle: centre = mean of the path points, radius = their mean
-  distance from it.
+  for bigger suns). A lasso drag is a ring whose diameter runs from the press point to the pointer (no freehand trail), so the
+  ring always fits exactly between them and updates live while dragging.
 - Targets: any present sun, a wormhole, a white hole, a supernova, or a world point. With fog of war the target's
   position must be visible to the ordering faction (`Fogged`); suns are always visible through their own small area.
 

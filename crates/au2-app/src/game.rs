@@ -134,15 +134,11 @@ impl Speed {
     }
 }
 
-/// Smallest-effort circle for a drawn lasso: centroid of the path and the mean distance of its points.
+/// The circle of a lasso drag: the press point and the pointer are the two ends of its diameter, so the ring always
+/// fits exactly between them. `path` is `[start, current]`.
 pub fn lasso_circle(path: &[Vec2]) -> Option<(Vec2, f64)> {
-    if path.len() < 3 {
-        return None;
-    }
-    let n = path.len() as f64;
-    let c = path.iter().fold(Vec2::ZERO, |a, &p| a + p) * (1.0 / n);
-    let r = path.iter().map(|p| p.dist(c)).sum::<f64>() / n;
-    Some((c, r))
+    let (&a, &b) = (path.first()?, path.get(1)?);
+    Some(((a + b) * 0.5, a.dist(b) * 0.5))
 }
 
 pub struct Game {
@@ -529,19 +525,17 @@ impl Game {
                 self.drag = Some(input.mouse);
                 self.lasso = vec![wp];
             }
-            if self.drag.is_some() && input.left_down {
-                if self.lasso.last().map(|l| l.dist(wp) * k as f64 > 4.0).unwrap_or(true) {
-                    self.lasso.push(wp);
-                }
+            if let (Some(_), true) = (self.drag, input.left_down) {
+                // only the start and the pointer matter: the ring spans them
+                self.lasso.truncate(1);
+                self.lasso.push(wp);
             }
             if input.left_released {
                 if let Some(start) = self.drag.take() {
-                    // how far the drag ever got from where it began (a closed lasso ends where it started)
-                    let path = std::mem::take(&mut self.lasso);
-                    let reach = path.iter().map(|p| p.dist(path[0])).fold(0.0f64, f64::max) * k as f64;
-                    let moved = ((input.mouse.0 - start.0).abs() + (input.mouse.1 - start.1).abs()).max(reach as f32);
+                    let mut path = std::mem::take(&mut self.lasso);
+                    path.truncate(1);
+                    let moved = (input.mouse.0 - start.0).abs() + (input.mouse.1 - start.1).abs();
                     if moved > input.drag_slop() {
-                        let mut path = path;
                         path.push(wp);
                         if let Some((c, r)) = lasso_circle(&path) {
                             self.select_circle(c, r, input.shift());
@@ -619,11 +613,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_drawn_lasso_becomes_its_circle() {
-        let path: Vec<Vec2> = (0..36).map(|k| Vec2::new(100.0, 50.0) + au2_sim::math::dir_deg(k as f64 * 10.0) * 300.0).collect();
-        let (c, r) = lasso_circle(&path).unwrap();
-        assert!(c.dist(Vec2::new(100.0, 50.0)) < 1.0 && (r - 300.0).abs() < 1.0);
-        assert!(lasso_circle(&path[..2]).is_none());
+    fn a_lasso_ring_spans_the_press_point_and_the_pointer() {
+        let (c, r) = lasso_circle(&[Vec2::new(0.0, 0.0), Vec2::new(300.0, 400.0)]).unwrap();
+        assert!(c.dist(Vec2::new(150.0, 200.0)) < 1e-9 && (r - 250.0).abs() < 1e-9);
+        assert!(lasso_circle(&[Vec2::ZERO]).is_none());
     }
 
     fn level(stem: &str) -> Game {
@@ -647,18 +640,16 @@ mod tests {
         let home = g.own_sun_ids()[0];
         let c = g.to_screen(g.sim.sun(home).unwrap().pos, view);
         let r = 70.0; // screen px, more than the cloud at the fitted zoom
+        // press on one side of the cloud, wander about, release on the other side: the ring spans press and release
         frame(&mut g, |i| {
-            i.mouse = (c.0 + r, c.1);
+            i.mouse = (c.0 - r, c.1);
             i.left_pressed = true;
             i.left_down = true;
         });
-        for k in 1..=24 {
-            let a = k as f32 / 24.0 * std::f32::consts::TAU;
-            frame(&mut g, |i| {
-                i.mouse = (c.0 + r * a.cos(), c.1 + r * a.sin());
-                i.left_down = true;
-            });
-        }
+        frame(&mut g, |i| {
+            i.mouse = (c.0, c.1 - 300.0);
+            i.left_down = true;
+        });
         frame(&mut g, |i| {
             i.mouse = (c.0 + r, c.1);
             i.left_released = true;

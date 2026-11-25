@@ -584,13 +584,9 @@ pub fn draw_game(c: &mut Canvas, g: &Game, input: &Input) {
         }
     }
     if g.lasso.len() >= 2 {
-        let pts: Vec<(f32, f32)> = g.lasso.iter().map(|&p| sp(p)).collect();
-        for w in pts.windows(2) {
-            c.line(w[0].0, w[0].1, w[1].0, w[1].1, 2.0, FACTION_COLORS[0], 0.8);
-        }
         if let Some((cc, r)) = lasso_circle(&g.lasso) {
             ground_disc(c, &cam, cc, r, FACTION_COLORS[0], 0.08);
-            ground_ring(c, &cam, cc, r, 1.0, FACTION_COLORS[0], 0.5);
+            ground_ring(c, &cam, cc, r, 2.0, FACTION_COLORS[0], 0.8);
         }
     }
 
